@@ -1,0 +1,308 @@
+---
+title: "Data requirements"
+description: "Learn what format your data must be in for TSGAM Estimator"
+---
+
+TSGAM Estimator imposes a small set of strict requirements on the shape and format of input data. Meeting these requirements is necessary for the model to infer time structure correctly.
+
+---
+
+## Quick summary
+
+<CardGroup cols={2}>
+  <Card title="X must be a DataFrame" icon="table">
+    Input features must be a `pandas.DataFrame` with a `DatetimeIndex` (or
+    datetime as the first column).
+  </Card>
+  <Card title="Timestamps must be regular" icon="clock">
+    `fit()` tolerates gaps; `predict()` requires strictly regular, gap-free
+    timestamps at the same frequency as training.
+  </Card>
+  <Card title="y must not contain NaN" icon="x-circle">
+    The target array is validated by `check_X_y`. Any `NaN` in `y` raises a
+    `ValueError` before fitting begins.
+  </Card>
+  <Card title="Column order matches exog_config" icon="list-ordered">
+    The `i`-th exogenous config applies to the `i`-th numeric column in `X`.
+    Order must be consistent between `fit()` and `predict()`.
+  </Card>
+</CardGroup>
+
+---
+
+## DataFrame format
+
+`X` must be a `pandas.DataFrame`. The estimator expects time information in one of two forms:
+
+<Tabs>
+  <Tab title="DatetimeIndex (recommended)">
+    ```python
+    import pandas as pd
+    import numpy as np
+
+    dates = pd.date_range("2020-01-01", periods=8766, freq="h")
+
+    X = pd.DataFrame(
+        {
+            "temperature": np.random.randn(8766) * 10 + 15,
+            "price": np.random.rand(8766) * 50 + 20,
+        },
+        index=dates,   # DatetimeIndex
+    )
+    y = np.log(np.random.rand(8766) * 100 + 200)
+    ```
+  </Tab>
+  <Tab title="Datetime first column">
+    If the DataFrame does not have a `DatetimeIndex`, the **first column**
+    must contain datetime values. All other columns are treated as exogenous
+    features.
+
+    ```python
+    import pandas as pd
+    import numpy as np
+
+    n = 8766
+    dates = pd.date_range("2020-01-01", periods=n, freq="h")
+
+    X = pd.DataFrame(
+        {
+            "timestamp": dates,            # first column = datetime
+            "temperature": np.random.randn(n) * 10 + 15,
+        }
+    )
+    y = np.log(np.random.rand(n) * 100 + 200)
+    ```
+
+    The datetime column is extracted automatically and is **not** treated as
+    an exogenous feature.
+  </Tab>
+</Tabs>
+
+<Note>
+A plain NumPy array is not accepted. The estimator requires a `pandas.DataFrame` so it can extract timestamps. Passing anything else raises a `ValueError`.
+</Note>
+
+---
+
+## Timestamp regularity
+
+### During `fit()` — gaps are tolerated
+
+Training data may have missing timestamps (e.g., meter outages, daylight-saving gaps). The estimator infers the base frequency from the most common time difference and masks out boundary rows produced by lead/lag operations.
+
+```python
+# Gaps are allowed in training data
+dates_with_gap = dates.delete([100, 101, 102])   # remove 3 hours
+X_gapped = X.iloc[np.isin(np.arange(len(X)), [100, 101, 102], invert=True)]
+estimator.fit(X_gapped, y_gapped)   # works fine
+```
+
+### During `predict()` — no gaps allowed
+
+Prediction timestamps must be **strictly regular** at the same frequency that was inferred during training (stored as `estimator.freq_`). Any gap in the prediction index will raise a `ValueError`.
+
+```python
+# Correct: regular hourly index
+X_test = pd.DataFrame(
+    {"temperature": np.random.randn(168) * 10 + 15},
+    index=pd.date_range("2021-01-01", periods=168, freq="h"),
+)
+y_pred = estimator.predict(X_test)   # OK
+
+# Incorrect: gap in prediction index
+X_test_gapped = X_test.iloc[[i for i in range(168) if i != 5]]
+estimator.predict(X_test_gapped)   # raises ValueError
+```
+
+<Warning>
+  Always use a regularly spaced date range for prediction. The inferred frequency of prediction timestamps must match `estimator.freq_` exactly, or a `ValueError` is raised.
+</Warning>
+
+---
+
+## Target array `y`
+
+- Must be a 1-D array-like (NumPy array, list, pandas Series) of shape `(n_samples,)`.
+- Must not contain `NaN` values — `check_X_y` rejects them before fitting.
+- Can be in any numeric scale; log-transforming strictly positive targets is recommended when the components are multiplicative.
+
+```python
+# Log-transform positive targets for multiplicative models
+y_log = np.log(demand_values)           # fit in log space
+estimator.fit(X, y_log)
+
+y_pred_log = estimator.predict(X_test)
+y_pred = np.exp(y_pred_log)             # convert back to original scale
+```
+
+<Note>
+`NaN` values in exogenous columns of `X` that arise from lead/lag boundary effects are handled internally via `combined_valid_mask_`. Only `NaN` in `y` or in the non-lag-padded portion of `X` causes an error.
+</Note>
+
+---
+
+## Index sorting
+
+The `sort_index` field in `TsgamEstimatorConfig` controls whether the estimator automatically reorders rows by time.
+
+| `sort_index` | Behaviour |
+|---|---|
+| `True` (default) | Rows are sorted by timestamp before fitting. `y` and `sample_weight` are reordered to match. |
+| `False` | Rows must already be in chronological order. A `ValueError` is raised if not. |
+
+```python
+from tsgam_estimator import TsgamEstimatorConfig, TsgamMultiPeriodicConfig
+
+# Auto-sort (default)
+config_autosort = TsgamEstimatorConfig(
+    multi_periodic_config=TsgamMultiPeriodicConfig(
+        num_harmonics=[6, 4, 3],
+        periods=[8766.0, 168.0, 24.0],
+    ),
+    exog_config=None,
+    sort_index=True,     # default
+)
+
+# Require pre-sorted data (slightly faster; raises if unsorted)
+config_presorted = TsgamEstimatorConfig(
+    multi_periodic_config=TsgamMultiPeriodicConfig(
+        num_harmonics=[6, 4, 3],
+        periods=[8766.0, 168.0, 24.0],
+    ),
+    exog_config=None,
+    sort_index=False,
+)
+```
+
+<Tip>
+If your pipeline guarantees data is always sorted (e.g., pulled from a time-series database), set `sort_index=False` to skip the sort step.
+</Tip>
+
+---
+
+## Frequency inference
+
+The estimator infers the data frequency during `fit()` and stores it as `estimator.freq_`.
+
+```python
+estimator.fit(X, y)
+print(estimator.freq_)   # e.g. "1h" for hourly data
+```
+
+Frequencies are stored with a numeric prefix and in lowercase (e.g., `"1h"`, `"15min"`, `"1d"`). The stored frequency is used to:
+
+- Convert timestamps to numeric indices (hours since the reference timestamp).
+- Validate that `predict()` data has the same frequency.
+- Infer default `period_hours` for trend and outlier components.
+
+---
+
+## Minimum sample count
+
+The minimum number of training samples is determined by the maximum lag configured across all exogenous variables and the AR component.
+
+For `lags=[-3, -2, -1, 0, 1, 2, 3]` the minimum is `max(3, 0) + 3 + 1 = 7` samples. For `ar_config=TsgamArConfig(lags=[1, 24])` the minimum AR contribution is `24 + 1 = 25` samples.
+
+<Warning>
+`check_X_y` enforces the minimum sample requirement. If your training set is too short for the configured lags, fitting raises a `ValueError` before any optimization is attempted.
+</Warning>
+
+---
+
+## Time zones
+
+The estimator does not perform any time zone conversion. Timestamps are used as-is. To avoid ambiguity:
+
+- Use timezone-naive timestamps consistently.
+- If your data spans a DST boundary, convert to UTC before building the DataFrame.
+
+---
+
+## Complete working example
+
+```python
+import pandas as pd
+import numpy as np
+from tsgam_estimator import (
+    TsgamEstimator,
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamSplineConfig,
+    TsgamLinearConfig,
+    PERIOD_HOURLY_DAILY,
+    PERIOD_HOURLY_WEEKLY,
+    PERIOD_HOURLY_YEARLY,
+)
+
+# --- Training data ---
+train_dates = pd.date_range("2020-01-01", periods=8766, freq="h")
+
+X_train = pd.DataFrame(
+    {
+        "temperature": np.random.randn(8766) * 10 + 15,   # column 0 → exog_config[0]
+        "price":       np.random.rand(8766) * 50 + 20,    # column 1 → exog_config[1]
+    },
+    index=train_dates,
+)
+y_train = np.log(np.random.rand(8766) * 100 + 200)        # no NaN allowed
+
+# --- Configuration ---
+config = TsgamEstimatorConfig(
+    multi_periodic_config=TsgamMultiPeriodicConfig(
+        num_harmonics=[6, 4, 3],
+        periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+    ),
+    exog_config=[
+        TsgamSplineConfig(n_knots=10, lags=[-3, -2, -1, 0, 1, 2, 3]),  # temperature
+        TsgamLinearConfig(lags=[-1, 0, 1]),                              # price
+    ],
+    sort_index=True,    # auto-sort rows by timestamp
+)
+
+# --- Fit ---
+estimator = TsgamEstimator(config=config)
+estimator.fit(X_train, y_train)
+print("Inferred frequency:", estimator.freq_)   # "1h"
+
+# --- Predict ---
+test_dates = pd.date_range("2021-01-01", periods=168, freq="h")   # no gaps
+X_test = pd.DataFrame(
+    {
+        "temperature": np.random.randn(168) * 10 + 15,
+        "price":       np.random.rand(168) * 50 + 20,
+    },
+    index=test_dates,
+)
+y_pred_log = estimator.predict(X_test)
+y_pred = np.exp(y_pred_log)
+```
+
+---
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="Can X contain NaN values in the exogenous columns?">
+    `NaN` values introduced at the **boundaries** of the series due to
+    lead/lag shifting are handled transparently by `combined_valid_mask_` — those
+    rows are excluded from the loss. However, `NaN` values in the interior of the
+    series (not caused by padding) are not handled and will produce incorrect
+    basis matrices. Clean interior `NaN` values before calling `fit()`.
+  </Accordion>
+  <Accordion title="Does the DataFrame need to have column names?">
+    No. Column names are not used internally. Only column **position** matters
+    for matching exogenous configs to columns.
+  </Accordion>
+  <Accordion title="Can I pass a pandas Series as y?">
+    Yes. Any array-like of shape `(n_samples,)` is accepted. `check_X_y`
+    converts it to a NumPy array internally.
+  </Accordion>
+  <Accordion title="What happens if fit() and predict() use different date ranges?">
+    The estimator uses `time_reference_` (the first training timestamp) as the
+    origin for time indices, so prediction timestamps can be before or after the
+    training window. Fourier patterns repeat correctly. The trend component
+    extrapolates using the last fitted trend value (linear extrapolation for
+    `LINEAR` trend, flat for `NONLINEAR`). Outlier corrections default to `0`
+    for periods outside training.
+  </Accordion>
+</AccordionGroup>

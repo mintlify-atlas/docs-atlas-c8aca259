@@ -1,0 +1,233 @@
+---
+title: "Autoregressive residual modeling"
+description: "Capture remaining temporal dependencies by fitting an AR model on residuals"
+---
+
+After the baseline GAM is fit (Fourier + exogenous + trend + outlier), residuals often still exhibit temporal autocorrelation. `TsgamArConfig` adds an autoregressive (AR) model on those residuals to capture the remaining structure.
+
+---
+
+## How the AR step works
+
+<Steps>
+  <Step title="Fit the baseline GAM">
+    `TsgamEstimator.fit()` first solves the main regularized optimization
+    problem, producing coefficients for the constant, Fourier, exogenous,
+    trend, and outlier terms.
+  </Step>
+  <Step title="Compute baseline residuals">
+    Residuals are computed on the valid training samples (rows not masked by
+    lead/lag boundaries): `residuals = y[valid_mask] - baseline_pred[valid_mask]`.
+  </Step>
+  <Step title="Build the AR design matrix">
+    A running-window view of the residuals is constructed. For `lags=[1, 2]`,
+    each row contains `[residual(t-1), residual(t-2)]`.
+  </Step>
+  <Step title="Solve the L1-constrained AR problem">
+    CVXPY minimizes the sum of squared errors subject to an L1 norm constraint
+    on the AR coefficients:
+
+    ```
+    minimize  ||residuals - B @ theta - intercept||²
+    subject to  ||theta||₁ ≤ l1_constraint
+    ```
+  </Step>
+  <Step title="Fit the noise distribution">
+    A Laplace distribution is fit to the AR model's own residuals. The
+    parameters `ar_noise_loc_` and `ar_noise_scale_` are stored for use
+    in `sample()`.
+  </Step>
+</Steps>
+
+<Note>
+The AR model is fit on **unweighted** residuals even if `sample_weight` was supplied to `fit()`. Weighting applies only to the main GAM loss.
+</Note>
+
+---
+
+## Configuration — `TsgamArConfig`
+
+```python
+from tsgam_estimator import TsgamArConfig
+
+# AR(1): use the immediately preceding residual only
+ar1 = TsgamArConfig(
+    lags=[1],
+    l1_constraint=0.95,
+)
+
+# AR(2): use the two preceding residuals
+ar2 = TsgamArConfig(
+    lags=[1, 2],
+    l1_constraint=0.8,
+)
+
+# Sparse AR with non-contiguous lags: 1 hour and 24 hours back
+ar_sparse = TsgamArConfig(
+    lags=[1, 24],
+    l1_constraint=0.95,
+)
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `lags` | `list[int]` | required | AR lag indices. Use positive integers only. |
+| `l1_constraint` | `float` | `0.95` | Upper bound on `||theta||₁`. Controls sparsity. |
+
+### `l1_constraint`
+
+`l1_constraint` bounds the total absolute weight that can be distributed across all AR lags. It controls the trade-off between fitting autocorrelation tightly and keeping the AR model sparse.
+
+| `l1_constraint` | Effect |
+|-----------------|--------|
+| Close to `1.0` | Near-unit-root AR process; strong persistence |
+| `0.5` – `0.8` | Moderate autocorrelation captured |
+| `0.0` | All coefficients forced to zero (no AR effect) |
+
+<Tip>
+Start with `l1_constraint=0.95` for AR(1). If autocorrelation plots show significant lags beyond 1, try `lags=[1, 2]` or `lags=[1, 24]` for hourly data (24 = previous day same hour).
+</Tip>
+
+---
+
+## When to use AR
+
+Use `TsgamArConfig` when:
+
+- The residuals from the baseline model still show significant autocorrelation at short lags.
+- Your application benefits from temporally coherent uncertainty quantification via `sample()`.
+- There are transient demand spikes or dips that are not explained by exogenous variables or outlier detection.
+
+You generally do **not** need AR when:
+
+- Residuals are approximately i.i.d. after the baseline fit.
+- You are forecasting far ahead (e.g., a week or more) where AR memory has decayed.
+
+---
+
+## Fitted attributes
+
+After `fit()` with an `ar_config`, the following attributes are populated on the estimator:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `ar_coef_` | `ndarray` | AR coefficients (`theta`), shape `(len(lags),)` |
+| `ar_intercept_` | `float` | Fitted intercept for the AR model |
+| `ar_noise_loc_` | `float` | Location of the fitted Laplace noise distribution |
+| `ar_noise_scale_` | `float` | Scale of the fitted Laplace noise distribution |
+
+If the AR optimization fails, all four attributes are set to `None`.
+
+```python
+import numpy as np
+
+print("AR coefficients:", estimator.ar_coef_)
+print("AR intercept:   ", estimator.ar_intercept_)
+print("Noise location: ", estimator.ar_noise_loc_)
+print("Noise scale:    ", estimator.ar_noise_scale_)
+```
+
+---
+
+## Predictions vs. samples
+
+`predict()` returns the **deterministic baseline** only — the AR component is **not** included in point predictions.
+
+```python
+# Deterministic forecast (no AR noise)
+y_pred = estimator.predict(X_test)
+```
+
+Use `sample()` to generate stochastic sample paths that incorporate AR noise rollout:
+
+```python
+# 200 sample paths with AR noise
+samples = estimator.sample(X_test, n_samples=200, random_state=42)
+# shape: (200, len(X_test))
+
+y_hat = np.exp(np.mean(samples, axis=0))   # mean forecast in original scale
+p10   = np.exp(np.percentile(samples, 10, axis=0))
+p90   = np.exp(np.percentile(samples, 90, axis=0))
+```
+
+<Note>
+When `ar_config=None` or when the AR optimization fails, `sample()` falls back to adding small independent Laplace noise (`scale=0.1`) to the baseline predictions.
+</Note>
+
+---
+
+## Full example
+
+```python
+import pandas as pd
+import numpy as np
+from tsgam_estimator import (
+    TsgamEstimator,
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamSplineConfig,
+    TsgamArConfig,
+    PERIOD_HOURLY_DAILY,
+    PERIOD_HOURLY_WEEKLY,
+    PERIOD_HOURLY_YEARLY,
+)
+
+dates = pd.date_range("2020-01-01", periods=8766, freq="h")
+X = pd.DataFrame({"temp": np.random.randn(8766) * 10 + 15}, index=dates)
+y = np.log(np.random.rand(8766) * 100 + 200)
+
+config = TsgamEstimatorConfig(
+    multi_periodic_config=TsgamMultiPeriodicConfig(
+        num_harmonics=[6, 4, 3],
+        periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+    ),
+    exog_config=[
+        TsgamSplineConfig(n_knots=10, lags=[-3, -2, -1, 0, 1, 2, 3]),
+    ],
+    ar_config=TsgamArConfig(lags=[1], l1_constraint=0.95),
+)
+
+estimator = TsgamEstimator(config=config)
+estimator.fit(X, y)
+
+# Point prediction (no AR noise)
+X_test = pd.DataFrame(
+    {"temp": np.random.randn(48) * 10 + 15},
+    index=pd.date_range("2021-01-01", periods=48, freq="h"),
+)
+y_pred = estimator.predict(X_test)
+
+# Probabilistic samples (with AR noise)
+samples = estimator.sample(X_test, n_samples=500, random_state=0)
+```
+
+---
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="Why are AR coefficients sometimes all zero?">
+    If `l1_constraint` is very small, or if the baseline model already
+    explains most of the variance, the optimizer may set all AR coefficients
+    to zero. This is expected behaviour — it means the AR step found no
+    additional structure to exploit.
+  </Accordion>
+  <Accordion title="Can I use non-contiguous lags, e.g. [1, 24]?">
+    Yes. `lags` accepts any list of positive integers. `[1, 24]` is a
+    common choice for hourly energy data: lag 1 captures short-term
+    autocorrelation and lag 24 captures the same-hour-previous-day effect.
+  </Accordion>
+  <Accordion title="Does the AR step affect predict() output?">
+    No. `predict()` returns the deterministic baseline. The AR term
+    only contributes to `sample()`, which performs a full AR noise rollout
+    over the prediction horizon.
+  </Accordion>
+  <Accordion title="Why Laplace noise rather than Gaussian?">
+    Laplace noise has heavier tails than Gaussian, which better models the
+    spiky, heavy-tailed residuals common in energy and demand time series.
+    The parameters are fitted using `scipy.stats.laplace.fit()` on the
+    AR model's residuals.
+  </Accordion>
+</AccordionGroup>

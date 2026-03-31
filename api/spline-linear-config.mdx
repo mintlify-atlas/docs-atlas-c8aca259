@@ -1,0 +1,103 @@
+---
+title: 'TsgamSplineConfig and TsgamLinearConfig'
+description: 'Configuration for exogenous variable basis functions with optional lead/lag offsets'
+---
+
+Two config classes are available for modeling exogenous variables (e.g. temperature, irradiance). Choose based on the expected relationship between the variable and your target:
+
+- **`TsgamSplineConfig`** — non-linear relationship modeled with cubic splines (e.g. temperature vs. load)
+- **`TsgamLinearConfig`** — linear relationship (e.g. a binary on/off indicator)
+
+Both classes support lead/lag offsets so the model can account for delayed or anticipatory effects.
+
+<Tabs>
+  <Tab title="TsgamSplineConfig">
+    ## Parameters
+
+    <ParamField path="n_knots" type="int | None" required>
+      Number of knots for the spline basis. Knots are evenly spaced between the minimum and maximum of the variable. If `None`, you must provide knot locations explicitly via `knots`. Ignored when `knots` is non-empty.
+    </ParamField>
+
+    <ParamField path="lags" type="list[int]" default="[0]">
+      Lead/lag offsets for the exogenous variable. Positive values look back (lag), negative values look forward (lead). For example, `[-3, -2, -1, 0, 1, 2, 3]` includes 3 hours ahead, current, and 3 hours back.
+    </ParamField>
+
+    <ParamField path="reg_weight" type="float" default="1e-4">
+      Regularization weight for spline coefficients. Higher values increase smoothness. Typical range: `1e-5` to `1e-3`.
+    </ParamField>
+
+    <ParamField path="diff_reg_weight" type="float" default="1.0">
+      Regularization weight for differences between coefficients at adjacent lags. Higher values encourage smoother transitions across lags, making lag coefficients more similar to each other.
+    </ParamField>
+
+    <ParamField path="knots" type="ndarray | list[float]" default="[]">
+      Explicit knot locations for the spline. When provided (non-empty), `n_knots` is ignored. If empty, knots are auto-generated from `n_knots`.
+    </ParamField>
+
+    <Warning>
+      Use `len(config.knots) > 0` to check whether explicit knots are set — do not rely on truthiness, as a NumPy array raises an ambiguous boolean error.
+    </Warning>
+
+    ## Example
+
+    ```python
+    from tsgam_estimator import TsgamSplineConfig
+
+    # Auto-generate 10 evenly-spaced knots; include current hour and ±1 hour
+    config = TsgamSplineConfig(
+        n_knots=10,
+        lags=[-1, 0, 1],
+    )
+
+    # Use explicit knot locations (n_knots is ignored)
+    config_explicit = TsgamSplineConfig(
+        n_knots=None,
+        knots=[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+        lags=[0],
+    )
+    ```
+  </Tab>
+
+  <Tab title="TsgamLinearConfig">
+    ## Parameters
+
+    <ParamField path="lags" type="list[int]" default="[0]">
+      Lead/lag offsets for the exogenous variable. Positive values look back (lag), negative values look forward (lead). For example, `[-1, 0, 1]` includes 1 hour ahead, current, and 1 hour back.
+    </ParamField>
+
+    <ParamField path="reg_weight" type="float" default="1e-4">
+      Regularization weight for linear coefficients. Higher values increase regularization. Typical range: `1e-5` to `1e-3`.
+    </ParamField>
+
+    <ParamField path="diff_reg_weight" type="float" default="1.0">
+      Regularization weight for differences between coefficients at adjacent lags. Higher values encourage smoother transitions across lags, making lag coefficients more similar to each other.
+    </ParamField>
+
+    ## Example
+
+    ```python
+    from tsgam_estimator import TsgamLinearConfig
+
+    # Linear effect with ±2-hour lead/lag window
+    config = TsgamLinearConfig(lags=[-2, -1, 0, 1, 2])
+
+    # Current hour only, tighter regularization
+    config_simple = TsgamLinearConfig(
+        lags=[0],
+        reg_weight=1e-3,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Choosing between spline and linear
+
+| Scenario | Recommended config |
+|---|---|
+| Non-linear relationship (e.g. temperature vs. energy load) | `TsgamSplineConfig` |
+| Linear or near-linear relationship (e.g. binary indicator, price signal) | `TsgamLinearConfig` |
+| Unknown relationship | Start with `TsgamSplineConfig` |
+
+<Tip>
+  When using `TsgamSplineConfig` with a lag window, set `diff_reg_weight` higher (e.g. `5.0`) to encourage the spline shape to be consistent across lags.
+</Tip>

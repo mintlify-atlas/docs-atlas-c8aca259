@@ -1,0 +1,240 @@
+---
+title: "Solar PV generation forecasting"
+description: "Forecast photovoltaic generation using trend modeling to capture system degradation or growth"
+---
+
+This example demonstrates forecasting solar photovoltaic (PV) AC power output at 15-minute resolution. The key challenge with PV data is that the underlying system capacity changes over time — panels degrade slowly, inverters are added, or an entire fleet grows. `TsgamTrendConfig` models this long-term drift as a smooth trend that is constant within each day but varies from day to day.
+
+<CardGroup cols={2}>
+  <Card title="Dataset" icon="database">
+    15-minute AC power from a PV system, along with module temperature and plane-of-array (POA) irradiance. Data is pre-processed through the `solar-data-tools` pipeline before fitting.
+  </Card>
+  <Card title="Target" icon="sun">
+    Normalised AC power in log space: `log(AC_power / AC_power_max)`. Log transform handles the multiplicative effect of irradiance and stabilises overnight zeros (masked out before fitting).
+  </Card>
+  <Card title="Trend modeling" icon="trending-up">
+    `TsgamTrendConfig` with `trend_type='none'`, `'linear'`, or `'nonlinear'`. Trend is constant per day (`grouping=24.0`) and varies smoothly across days.
+  </Card>
+  <Card title="Ablation focus" icon="flask">
+    Three-way trend ablation: compare no-trend baseline against linear trend (constant annual degradation rate) and nonlinear monotonic trend (allows changing degradation rates).
+  </Card>
+</CardGroup>
+
+<Note>
+The trend is fitted in log space, so a linear trend corresponds to a constant **percentage** change per day — matching the physical degradation model used by the PV industry (typically 0.5–1% per year).
+</Note>
+
+## Prerequisites
+
+```python
+from tsgam_estimator import (
+    TsgamEstimator,
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamSplineConfig,
+    TsgamSolverConfig,
+    TsgamTrendConfig,
+    TrendType,
+)
+import numpy as np
+import pandas as pd
+```
+
+## Dataset and preprocessing
+
+PV data requires careful preprocessing before fitting: daytime-only samples, removal of error-flagged days, and normalisation. The `solar-data-tools` library automates most of this.
+
+```python
+# Requires: uv sync --group examples  (installs solar-data-tools)
+from solardatatools import DataHandler
+
+df = pd.read_csv("pv_system.csv", parse_dates=[0], index_col=0)
+df = df.resample("15min").mean()   # ensure uniform 15-minute grid
+
+dh = DataHandler(df)
+dh.fix_dst()
+dh.run_pipeline(
+    power_col="inv_03_ac_power_inv_149593",
+    max_val=2000,
+    extra_cols=["ambient_temperature_o_149575", "poa_irradiance_o_149574"],
+    linearity_threshold=0.1,
+)
+
+# Extract normalised power, mask nights and error days
+y = np.copy(dh.raw_data_matrix)
+y_max = np.nanmax(y)
+y[:, ~dh.daily_flags.no_errors] = np.nan   # remove flagged days
+y[~dh.boolean_masks.daytime] = np.nan       # remove nighttime
+y[y < 0.01 * y_max] = np.nan               # remove near-zero (cloud cover / dawn/dusk)
+y = y.ravel(order="F")
+y = y / y_max
+y = np.log(y)                               # log-transform
+
+# Extract weather covariates (also flattened column-major)
+x_temp  = dh.extra_matrices["ambient_temperature_o_149575"].ravel(order="F")
+x_irrad = dh.extra_matrices["poa_irradiance_o_149574"].ravel(order="F")
+x_irrad = np.clip(x_irrad, 0, None)
+
+# Normalise covariates
+x_temp  = x_temp  / (np.nanmax(x_temp)  or 1.0)
+x_irrad = x_irrad / (np.nanmax(x_irrad) or 1.0)
+
+# Keep only valid (daytime, non-NaN) samples
+valid = ~np.isnan(y) & np.isfinite(x_temp) & np.isfinite(x_irrad)
+y      = y[valid]
+x_temp = np.nan_to_num(x_temp[valid], nan=0.0)
+x_irrad = np.nan_to_num(x_irrad[valid], nan=0.0)
+
+n = len(y)
+timestamps = pd.date_range(start=df.index[0], periods=n, freq="15min")
+
+X = pd.DataFrame({"temp": x_temp, "irrad": x_irrad}, index=timestamps)
+```
+
+## Train/test split
+
+```python
+TRAIN_FRACTION = 0.8
+split = int(len(y) * TRAIN_FRACTION)
+
+X_train, X_test = X.iloc[:split], X.iloc[split:]
+y_train, y_test = y[:split], y[split:]
+```
+
+## Trend configurations
+
+The seasonal backbone is the same for all three configurations — only `trend_config` changes.
+
+```python
+multi_periodic = TsgamMultiPeriodicConfig(
+    num_harmonics=[6, 10],
+    periods=[365.2425 * 24.0, 24.0],  # yearly and daily periods in hours
+    reg_weight=1e-2,
+)
+
+exog_config = [
+    TsgamSplineConfig(n_knots=10, lags=[0], reg_weight=1e-4),  # module temperature
+    TsgamSplineConfig(n_knots=10, lags=[0], reg_weight=1e-4),  # POA irradiance
+]
+
+solver_config = TsgamSolverConfig(solver="CLARABEL", verbose=False)
+```
+
+<Tabs>
+  <Tab title="No trend">
+    ```python
+    config_none = TsgamEstimatorConfig(
+        multi_periodic_config=multi_periodic,
+        exog_config=exog_config,
+        trend_config=None,            # no trend — assumes stable system capacity
+        solver_config=solver_config,
+    )
+
+    est_none = TsgamEstimator(config=config_none)
+    est_none.fit(X_train, y_train)
+    pred_none = est_none.predict(X_test)
+    ```
+
+    Use when system capacity is known to be stable over the observation period. Errors in degrading systems will manifest as systematic under-prediction in later months.
+  </Tab>
+  <Tab title="Linear trend">
+    ```python
+    config_linear = TsgamEstimatorConfig(
+        multi_periodic_config=multi_periodic,
+        exog_config=exog_config,
+        trend_config=TsgamTrendConfig(
+            trend_type=TrendType.LINEAR,
+            grouping=24.0,    # one trend value per 24-hour day
+            reg_weight=10.0,  # penalises day-to-day changes in trend
+        ),
+        solver_config=solver_config,
+    )
+
+    est_linear = TsgamEstimator(config=config_linear)
+    est_linear.fit(X_train, y_train)
+    pred_linear = est_linear.predict(X_test)
+
+    # Inspect the fitted trend slope
+    if "trend_slope" in est_linear.variables_:
+        slope = float(est_linear.variables_["trend_slope"].value)
+        pct_per_year = (np.exp(slope * 365) - 1.0) * 100
+        print(f"Trend slope: {slope:.6f} log-units/day ({pct_per_year:+.2f}% per year)")
+    ```
+
+    Linear trend fits a constant degradation (or growth) rate. In log space this is a linear ramp, which corresponds to compound percentage change — the standard industry degradation model.
+  </Tab>
+  <Tab title="Nonlinear trend">
+    ```python
+    config_nonlinear = TsgamEstimatorConfig(
+        multi_periodic_config=multi_periodic,
+        exog_config=exog_config,
+        trend_config=TsgamTrendConfig(
+            trend_type=TrendType.NONLINEAR,
+            grouping=24.0,
+            reg_weight=10.0,
+        ),
+        solver_config=solver_config,
+    )
+
+    est_nonlinear = TsgamEstimator(config=config_nonlinear)
+    est_nonlinear.fit(X_train, y_train)
+    pred_nonlinear = est_nonlinear.predict(X_test)
+    ```
+
+    Nonlinear (monotonic) trend allows the degradation rate to vary over time — useful for fleet-expansion scenarios where new capacity is added in batches, or for systems that exhibit an initial rapid degradation followed by a slower steady state.
+  </Tab>
+</Tabs>
+
+## Compare trend types
+
+```python
+results = {}
+for name, est, pred_log in [
+    ("none",      est_none,      est_none.predict(X_test)),
+    ("linear",    est_linear,    est_linear.predict(X_test)),
+    ("nonlinear", est_nonlinear, est_nonlinear.predict(X_test)),
+]:
+    y_pred_orig = np.exp(pred_log) * y_max
+    y_true_orig = np.exp(y_test)   * y_max
+    rmse = np.sqrt(np.mean((y_true_orig - y_pred_orig) ** 2))
+    r2   = 1.0 - np.sum((y_true_orig - y_pred_orig) ** 2) / np.sum((y_true_orig - y_true_orig.mean()) ** 2)
+    results[name] = {"rmse_W": rmse, "r2": r2}
+    print(f"Trend={name:12s}  RMSE={rmse:.1f} W  R²={r2:.4f}")
+```
+
+<AccordionGroup>
+  <Accordion title="Why grouping=24.0 for 15-minute data?">
+    `grouping` specifies the period length in hours over which the trend value is held constant. For 15-minute PV data, `grouping=24.0` means one trend value per day (96 samples). This reflects the physical reality that degradation occurs on timescales of days to years, not within a single day.
+
+    Smaller `grouping` values create more frequent trend updates but increase the risk of the trend absorbing seasonal variation. Larger values reduce flexibility. For hourly data, `grouping=24.0` is still appropriate for daily trend updates.
+  </Accordion>
+  <Accordion title="reg_weight for trend smoothness">
+    `reg_weight` penalises the difference between consecutive daily trend values. A higher value (e.g., `100.0`) forces a very smooth, near-linear trend. A lower value (e.g., `1.0`) allows the trend to track noisier day-to-day variation.
+
+    For PV degradation, `reg_weight=10.0` typically provides a good balance — the trend is smooth enough to distinguish degradation from weather variability, but flexible enough to capture non-constant degradation rates.
+  </Accordion>
+  <Accordion title="TrendType enum values">
+    ```python
+    from tsgam_estimator import TrendType
+
+    TrendType.NONE       # 'none'      — no trend
+    TrendType.LINEAR     # 'linear'    — constant slope
+    TrendType.NONLINEAR  # 'nonlinear' — monotonic, varying slope
+    ```
+
+    You can also pass the string values directly: `trend_type='linear'`, `trend_type='nonlinear'`, `trend_type='none'`.
+  </Accordion>
+  <Accordion title="Periods for sub-hourly data">
+    For 15-minute PV data the periods must be specified in hours — the same unit as `grouping`. Hourly convenience constants (`PERIOD_HOURLY_DAILY`, `PERIOD_HOURLY_YEARLY`) still work, but you can also write the values directly:
+
+    ```python
+    multi_periodic = TsgamMultiPeriodicConfig(
+        num_harmonics=[6, 10],
+        periods=[365.2425 * 24.0, 24.0],  # yearly=8766h, daily=24h
+        reg_weight=1e-2,
+    )
+    ```
+
+    The estimator infers the data frequency from the `DatetimeIndex` spacing and maps period hours to sample counts automatically.
+  </Accordion>
+</AccordionGroup>

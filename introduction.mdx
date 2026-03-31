@@ -1,0 +1,61 @@
+---
+title: Introduction
+description: A scikit-learn compatible Python library for time series forecasting using Generalized Additive Models
+---
+
+**TSGAM Estimator** is a Python library for time series load forecasting built on Generalized Additive Models (GAMs). It provides a flexible, interpretable modeling framework that decomposes time series into seasonal patterns, exogenous variable effects, trends, and residual structure — all fitted via regularized convex optimization.
+
+The library follows the scikit-learn API (`fit` / `predict`), making it easy to integrate into existing data science workflows.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install the library and fit your first forecast model in minutes
+  </Card>
+  <Card title="Model components" icon="cubes" href="/guides/model-components">
+    Learn how Fourier seasonality, splines, trend, and AR residuals work together
+  </Card>
+  <Card title="Examples" icon="flask" href="/examples/energy-forecasting">
+    See real-world forecasting examples for energy, air quality, and solar PV
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/tsgam-estimator">
+    Full parameter and return-type documentation for every public class
+  </Card>
+</CardGroup>
+
+## Why TSGAM?
+
+Most forecasting libraries are either black-box neural networks or rigid statistical models. TSGAM sits in between: it is fully interpretable (each component has a direct physical meaning), yet flexible enough to capture complex real-world patterns.
+
+<CardGroup cols={2}>
+  <Card title="Interpretable by design" icon="magnifying-glass">
+    Every component — seasonality, temperature response, trend — can be inspected and explained individually
+  </Card>
+  <Card title="scikit-learn compatible" icon="puzzle-piece">
+    Implements `BaseEstimator` and `RegressorMixin`; works with pipelines, cross-validation, and grid search
+  </Card>
+  <Card title="Handles irregular data" icon="calendar-xmark">
+    Automatically infers data frequency and tolerates gaps in training data
+  </Card>
+  <Card title="Convex optimization" icon="chart-line">
+    Fitted via CVXPY with the CLARABEL solver — guaranteed global optimum, no random seeds required
+  </Card>
+</CardGroup>
+
+## Model overview
+
+A TSGAM model is an additive combination of independent components:
+
+```
+ŷ(t) = constant
+      + Fourier(t)          # seasonal patterns
+      + Σ spline(xᵢ, t)    # exogenous variables (e.g. temperature)
+      + trend(t)            # long-term drift
+      + outlier(t)          # anomalous periods
+      + AR(residuals)       # autoregressive correction
+```
+
+Each component is optional and independently configured. You can start with just a Fourier seasonal model and progressively add complexity.
+
+## License
+
+BSD 3-Clause — see the [repository](https://github.com/nimish/estimator) for details.

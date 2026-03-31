@@ -1,0 +1,224 @@
+---
+title: "Model components"
+description: "Understand how Fourier seasonality, spline exogenous variables, trend, outlier detection, and AR residuals work together"
+---
+
+TSGAM Estimator builds predictions from a sum of interpretable components. Each component can be enabled, tuned, or omitted independently via `TsgamEstimatorConfig`.
+
+## Additive model structure
+
+The model prediction at time `t` is:
+
+```
+ŷ(t) = constant
+      + Fourier(t)            # multi-periodic seasonality
+      + Σ spline(xᵢ, t)       # exogenous variable effects (one per column)
+      + trend(t)              # long-term drift (constant per period)
+      + outlier(t)            # sparse per-period corrections
+      + AR(residuals)         # autoregressive correction at predict time
+```
+
+All terms are **additive**. The model is typically fit on a log-transformed target so that additive corrections in log space translate to multiplicative effects in the original scale.
+
+<Note>
+The AR component is fit on training residuals but is **not included** in `predict()`. Use `sample()` to generate stochastic sample paths that incorporate AR noise.
+</Note>
+
+---
+
+## Components
+
+<CardGroup cols={2}>
+  <Card title="Fourier seasonality" icon="wave-square">
+    Models repeating daily, weekly, and yearly cycles using sine/cosine basis
+    functions. Configured via `TsgamMultiPeriodicConfig`.
+  </Card>
+  <Card title="Exogenous variables" icon="thermometer">
+    Captures the effect of external drivers (e.g., temperature) using cubic
+    splines or linear functions. Configured via `TsgamSplineConfig` or
+    `TsgamLinearConfig`.
+  </Card>
+  <Card title="Trend" icon="trending-up">
+    Models long-term drift that is constant within each period (e.g., each
+    day) but changes across periods. Configured via `TsgamTrendConfig`.
+  </Card>
+  <Card title="Outlier detection" icon="alert-triangle">
+    Assigns a sparse additive correction to anomalous periods using L1
+    regularization. Configured via `TsgamOutlierConfig`.
+  </Card>
+  <Card title="Autoregressive residuals" icon="git-branch">
+    Fits an AR model on training residuals to capture remaining temporal
+    autocorrelation. Configured via `TsgamArConfig`.
+  </Card>
+  <Card title="Constant intercept" icon="minus">
+    A global bias term always included in every model. No configuration
+    needed — it is part of every `TsgamEstimatorConfig`.
+  </Card>
+</CardGroup>
+
+---
+
+## Fourier seasonality — `TsgamMultiPeriodicConfig`
+
+The Fourier component approximates periodic signals by summing sine and cosine pairs (harmonics) at each configured period. More harmonics capture sharper, more complex shapes; fewer harmonics produce smoother patterns.
+
+```python
+from tsgam_estimator import TsgamMultiPeriodicConfig
+
+# Three nested periods: yearly → weekly → daily
+multi_periodic = TsgamMultiPeriodicConfig(
+    num_harmonics=[6, 4, 3],
+    periods=[
+        365.2425 * 24,  # PERIOD_HOURLY_YEARLY = 8766 hours
+        7 * 24,         # PERIOD_HOURLY_WEEKLY = 168 hours
+        24,             # PERIOD_HOURLY_DAILY  = 24 hours
+    ],
+    reg_weight=1.0e-4,
+)
+```
+
+### Built-in period constants
+
+```python
+from tsgam_estimator import (
+    PERIOD_HOURLY_DAILY,    # 24
+    PERIOD_HOURLY_WEEKLY,   # 168
+    PERIOD_HOURLY_YEARLY,   # 8766.0
+    PERIOD_DAILY_YEARLY,    # 365.2425
+    PERIOD_WEEKLY_YEARLY,   # 52.1775
+)
+```
+
+### Choosing the number of harmonics
+
+| Situation | Recommendation |
+|-----------|----------------|
+| Smooth, slowly varying pattern | 2–4 harmonics |
+| Typical diurnal or weekly shape | 4–6 harmonics |
+| Sharp peaks or double-peaked shapes | 6–10 harmonics |
+| Noisy data, risk of overfitting | Fewer harmonics + higher `reg_weight` |
+
+<Tip>
+Use `get_recommended_periods(X, include_harmonics=True)` to automatically get appropriate periods **and** harmonic counts based on your data's inferred frequency.
+</Tip>
+
+```python
+from tsgam_estimator import get_recommended_periods
+
+periods, harmonics = get_recommended_periods(X, include_harmonics=True)
+
+multi_periodic = TsgamMultiPeriodicConfig(
+    num_harmonics=harmonics,
+    periods=periods,
+)
+```
+
+### `reg_weight` for Fourier
+
+`reg_weight` penalizes the magnitude of higher-frequency harmonics, acting as a smoothness prior. Higher values suppress oscillations; lower values allow the model to fit more complex shapes. Typical range: `1e-5` to `1e-3`.
+
+---
+
+## Combining components in `TsgamEstimatorConfig`
+
+All components are wired together in a single config object passed to `TsgamEstimator`.
+
+```python
+from tsgam_estimator import (
+    TsgamEstimator,
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamSplineConfig,
+    TsgamArConfig,
+    TsgamTrendConfig,
+    TsgamOutlierConfig,
+    TsgamSolverConfig,
+    PERIOD_HOURLY_DAILY,
+    PERIOD_HOURLY_WEEKLY,
+    PERIOD_HOURLY_YEARLY,
+)
+
+multi_periodic = TsgamMultiPeriodicConfig(
+    num_harmonics=[6, 4, 3],
+    periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+)
+
+exog_config = [
+    TsgamSplineConfig(n_knots=10, lags=[-3, -2, -1, 0, 1, 2, 3]),
+]
+
+trend_config = TsgamTrendConfig(trend_type="linear")
+
+outlier_config = TsgamOutlierConfig(reg_weight=0.002)
+
+ar_config = TsgamArConfig(lags=[1])
+
+config = TsgamEstimatorConfig(
+    multi_periodic_config=multi_periodic,
+    exog_config=exog_config,
+    trend_config=trend_config,
+    outlier_config=outlier_config,
+    ar_config=ar_config,
+    solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+)
+
+estimator = TsgamEstimator(config=config)
+estimator.fit(X_train, y_train)
+```
+
+<Note>
+Any component can be disabled by setting its config field to `None`. For example, `ar_config=None` disables the AR step entirely.
+</Note>
+
+---
+
+## Solver configuration — `TsgamSolverConfig`
+
+The optimization problem is solved using [CVXPY](https://www.cvxpy.org/). You can select the backend solver and toggle verbosity.
+
+```python
+from tsgam_estimator import TsgamSolverConfig
+
+solver_config = TsgamSolverConfig(
+    solver="CLARABEL",  # Recommended: fast and reliable
+    verbose=False,      # Set True during development to monitor convergence
+)
+```
+
+After fitting, check convergence with:
+
+```python
+print(estimator.problem_.status)  # "optimal" or "optimal_inaccurate"
+```
+
+<Warning>
+If `problem_.status` is not `"optimal"` or `"optimal_inaccurate"`, the fit raises a `ValueError`. This usually means data quality issues or misconfigured regularization weights.
+</Warning>
+
+---
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="Can I use the model without exogenous variables?">
+    Yes. Set `exog_config=None` in `TsgamEstimatorConfig`. The model will still
+    fit the Fourier, trend, and outlier components on time alone. X must still
+    be a DataFrame with a `DatetimeIndex`, but no numeric columns are required.
+  </Accordion>
+  <Accordion title="Can I use the model without a Fourier component?">
+    Yes. Set `multi_periodic_config=None`. This is useful when all periodicity
+    can be explained by exogenous variables, or when you want a pure trend +
+    exogenous model.
+  </Accordion>
+  <Accordion title="What scale should y be in?">
+    The model is scale-agnostic, but log-transforming a strictly positive target
+    (`y = np.log(demand)`) is strongly recommended when the true relationship is
+    multiplicative. Predictions will then be in log space; use `np.exp()` to
+    convert back.
+  </Accordion>
+  <Accordion title="How do I check which coefficients were fitted?">
+    After `fit()`, all CVXPY variables are accessible via `estimator.variables_`.
+    For example: `estimator.variables_['fourier_coef'].value` returns the fitted
+    Fourier coefficients as a NumPy array.
+  </Accordion>
+</AccordionGroup>

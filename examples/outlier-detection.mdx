@@ -1,0 +1,321 @@
+---
+title: "Outlier detection"
+description: "Detect anomalous days in time series data using sparse multiplicative corrections"
+---
+
+This example demonstrates the TSGAM outlier detector on synthetic hourly data with **known** injected outlier days. The detector assigns one correction value per day using L1 regularisation to enforce sparsity: most days receive a correction of zero, while genuinely anomalous days receive non-zero values.
+
+<CardGroup cols={2}>
+  <Card title="How it works" icon="shield-alert">
+    The outlier term `T @ outlier` adds a per-period correction to the model. `T` is a binary matrix mapping each sample to its day. L1 regularisation makes the correction vector sparse.
+  </Card>
+  <Card title="Log space" icon="function">
+    Corrections are additive in log space and therefore **multiplicative** in the original scale. `outlier[d] = log(0.2)` means day `d` is at 20% of the expected level.
+  </Card>
+  <Card title="reg_weight" icon="sliders">
+    Higher `reg_weight` → fewer outliers detected (more sparsity). Lower `reg_weight` → more sensitive, may detect more days. Start around `0.002` and tune from there.
+  </Card>
+  <Card title="Inspection" icon="search">
+    After fitting, read detected values via `estimator.variables_['outlier'].value` — a 1-D array with one entry per period (day).
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+```python
+from tsgam_estimator import (
+    TsgamEstimator,
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamOutlierConfig,
+    TsgamSolverConfig,
+    PERIOD_HOURLY_DAILY,
+    PERIOD_HOURLY_WEEKLY,
+)
+import numpy as np
+import pandas as pd
+```
+
+## Workflow
+
+<Steps>
+  <Step title="Generate synthetic data with known outliers">
+    Create 60 days of hourly data with daily and weekly seasonal patterns, then inject three outlier days at known multipliers.
+
+    ```python
+    np.random.seed(42)
+
+    n_days = 60
+    n_hours = n_days * 24
+    timestamps = pd.date_range("2020-01-01", periods=n_hours, freq="h")
+
+    time_hours = np.arange(n_hours)
+
+    # Seasonal patterns in log space (additive = multiplicative in original scale)
+    daily_pattern  = 2.0 + 1.5 * np.sin(2 * np.pi * time_hours / 24 - np.pi / 2)
+    weekly_pattern = 0.5 * np.sin(2 * np.pi * time_hours / 168)
+    trend          = 0.01 * time_hours / 24   # small linear drift
+
+    y_log = np.log(10.0) + daily_pattern + weekly_pattern + trend
+
+    # Inject three outlier days
+    outlier_days        = [10, 25, 40]
+    outlier_multipliers = [0.2, 2.0, 0.5]   # 20%, 200%, 50% of expected
+    true_log_corrections = np.zeros(n_days)
+
+    for day_idx, multiplier in zip(outlier_days, outlier_multipliers):
+        log_correction = np.log(multiplier)             # e.g. log(0.2) ≈ -1.609
+        true_log_corrections[day_idx] = log_correction
+        # Apply to all 24 hours in that day
+        y_log[day_idx * 24:(day_idx + 1) * 24] += log_correction
+
+    # Add Gaussian noise (in log space)
+    y_log += np.random.normal(0, 0.1, n_hours)
+
+    y_original = np.exp(y_log)   # original scale for reference
+    ```
+
+    The injected corrections are:
+
+    | Day | Multiplier | Log correction | Interpretation |
+    |-----|-----------|---------------|----------------|
+    | 10  | 0.2x      | ≈ -1.61       | 80% drop (e.g. planned outage or holiday) |
+    | 25  | 2.0x      | ≈ +0.69       | 2× spike (e.g. special event) |
+    | 40  | 0.5x      | ≈ -0.69       | 50% drop (e.g. partial outage) |
+  </Step>
+
+  <Step title="Prepare inputs">
+    The estimator takes a `DataFrame` with a `DatetimeIndex`. When there are no exogenous variables, pass an empty `DataFrame` carrying only the index.
+
+    ```python
+    X = pd.DataFrame(index=timestamps)
+    # y_log is the target array aligned to X.index
+    ```
+  </Step>
+
+  <Step title="Configure TsgamOutlierConfig">
+    Set `reg_weight` to control sparsity, and `period_hours=24.0` for daily outliers.
+
+    ```python
+    multi_periodic_config = TsgamMultiPeriodicConfig(
+        num_harmonics=[4, 3],
+        periods=[PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+        reg_weight=1e-4,
+    )
+
+    outlier_config = TsgamOutlierConfig(
+        reg_weight=0.01,     # moderate sparsity
+        period_hours=24.0,   # one correction value per day
+    )
+
+    config = TsgamEstimatorConfig(
+        multi_periodic_config=multi_periodic_config,
+        exog_config=None,
+        ar_config=None,
+        outlier_config=outlier_config,
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+    )
+    ```
+  </Step>
+
+  <Step title="Fit the model">
+    ```python
+    estimator = TsgamEstimator(config=config)
+    estimator.fit(X, y_log)
+    print(f"Solver status: {estimator.problem_.status}")
+    ```
+  </Step>
+
+  <Step title="Inspect detected outliers">
+    ```python
+    detected = estimator.variables_["outlier"].value   # shape: (n_days,)
+
+    print(f"Number of days: {len(detected)}")
+    print(f"Range: [{detected.min():.4f}, {detected.max():.4f}]")
+    print()
+
+    threshold = 0.1   # log-space threshold for "non-zero"
+    print("Non-zero detections:")
+    for day_idx, val in enumerate(detected):
+        if abs(val) > threshold:
+            multiplier = np.exp(val)
+            print(f"  Day {day_idx:3d}: log-correction={val:+.4f}  ({multiplier:.3f}x)")
+    ```
+
+    Example output for the synthetic data:
+
+    ```
+    Non-zero detections:
+      Day  10: log-correction=-1.5823  (0.205x)
+      Day  25: log-correction=+0.6614  (1.938x)
+      Day  40: log-correction=-0.6502  (0.522x)
+    ```
+
+    <Info>
+    The detected values are shrunk toward zero by the L1 penalty, so they will not exactly match the injected corrections. The sign and order of magnitude should be correct for genuinely anomalous days.
+    </Info>
+  </Step>
+
+  <Step title="Generate predictions">
+    ```python
+    # Predict on the training period (requires contiguous DatetimeIndex)
+    pred_log = estimator.predict(X)
+    pred_original = np.exp(pred_log)
+
+    residuals = y_original - pred_original
+    rmse = np.sqrt(np.mean(residuals ** 2))
+    print(f"RMSE (original scale): {rmse:.4f}")
+    ```
+  </Step>
+</Steps>
+
+## Effect of reg_weight
+
+`reg_weight` is the most important tuning parameter. Compare three values on the same data:
+
+<Tabs>
+  <Tab title="Low sensitivity (reg_weight=0.1)">
+    ```python
+    config_sparse = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[4, 3],
+            periods=[PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=1e-4,
+        ),
+        outlier_config=TsgamOutlierConfig(reg_weight=0.1, period_hours=24.0),
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+    )
+    ```
+
+    Only the largest outlier (2.0× spike) is likely to be detected. The 0.2× and 0.5× days may be shrunk to near-zero corrections. Use this setting when you want only extreme anomalies.
+  </Tab>
+  <Tab title="Moderate (reg_weight=0.01)">
+    ```python
+    config_moderate = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[4, 3],
+            periods=[PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=1e-4,
+        ),
+        outlier_config=TsgamOutlierConfig(reg_weight=0.01, period_hours=24.0),
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+    )
+    ```
+
+    All three injected outliers should be detected with reasonable accuracy. A small number of false positives on non-outlier days is possible. Good starting point for real-world data.
+  </Tab>
+  <Tab title="High sensitivity (reg_weight=0.001)">
+    ```python
+    config_sensitive = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[4, 3],
+            periods=[PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=1e-4,
+        ),
+        outlier_config=TsgamOutlierConfig(reg_weight=0.001, period_hours=24.0),
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+    )
+    ```
+
+    All three outliers are detected and their corrections are closer to the true values (less L1 shrinkage). However, more non-outlier days will receive small non-zero corrections. Use this when recall matters more than precision.
+  </Tab>
+</Tabs>
+
+## Verifying detection quality
+
+```python
+def verify_detection(true_corrections, detected, outlier_days, threshold=0.3):
+    """Compare detected outlier values against known ground truth."""
+    n_true     = sum(abs(v) > 1e-6 for v in true_corrections)
+    n_detected = sum(abs(v) > threshold for v in detected)
+    sparsity   = sum(abs(v) < threshold for v in detected) / len(detected)
+
+    print(f"True outlier days:     {n_true}")
+    print(f"Detected (|v|>{threshold}): {n_detected}")
+    print(f"Sparsity:             {sparsity:.1%}")
+    print()
+
+    for day in outlier_days:
+        true_val = true_corrections[day]
+        det_val  = detected[day]
+        error    = abs(true_val - det_val)
+        print(
+            f"  Day {day:3d}  "
+            f"true={true_val:+.4f} ({np.exp(true_val):.3f}x)  "
+            f"detected={det_val:+.4f} ({np.exp(det_val):.3f}x)  "
+            f"error={error:.4f}"
+        )
+
+verify_detection(true_log_corrections, detected, outlier_days=[10, 25, 40])
+```
+
+<AccordionGroup>
+  <Accordion title="Comparison: with vs. without outlier detector">
+    To see the impact of the outlier detector, fit a second model without it and compare residuals:
+
+    ```python
+    config_no_outlier = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[4, 3],
+            periods=[PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=1e-4,
+        ),
+        outlier_config=None,
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+    )
+
+    est_no_outlier = TsgamEstimator(config=config_no_outlier)
+    est_no_outlier.fit(X, y_log)
+    pred_no_outlier = np.exp(est_no_outlier.predict(X))
+
+    pred_with_outlier = np.exp(estimator.predict(X))
+
+    rmse_with    = np.sqrt(np.mean((y_original - pred_with_outlier) ** 2))
+    rmse_without = np.sqrt(np.mean((y_original - pred_no_outlier)   ** 2))
+
+    print(f"RMSE with outlier detector:    {rmse_with:.4f}")
+    print(f"RMSE without outlier detector: {rmse_without:.4f}")
+    ```
+  </Accordion>
+  <Accordion title="Weekly outlier detection">
+    To detect anomalous **weeks** rather than days, set `period_hours=168.0`:
+
+    ```python
+    outlier_config_weekly = TsgamOutlierConfig(
+        reg_weight=0.005,
+        period_hours=168.0,   # one correction per 7-day week
+    )
+    ```
+
+    The `variables_['outlier'].value` array then has one entry per week.
+  </Accordion>
+  <Accordion title="Outlier correction in log vs. original scale">
+    The correction values stored in `variables_['outlier']` are in log space. To convert to a multiplicative factor in the original scale:
+
+    ```python
+    detected = estimator.variables_["outlier"].value
+
+    for day_idx, log_val in enumerate(detected):
+        if abs(log_val) > 0.05:
+            multiplier = np.exp(log_val)
+            # multiplier > 1: anomalously high day
+            # multiplier < 1: anomalously low day
+            print(f"Day {day_idx}: {multiplier:.3f}x normal level")
+    ```
+
+    A value of `log_val = -1.609` corresponds to `np.exp(-1.609) ≈ 0.2`, meaning the day is at approximately 20% of its expected level.
+  </Accordion>
+  <Accordion title="Using the outlier detector on real data">
+    On real data with no known ground truth, tune `reg_weight` by inspecting the sparsity of the result:
+
+    - If more than ~10% of days are flagged, `reg_weight` is probably too low — increase it.
+    - If no days are flagged even though anomalies are visually obvious, decrease `reg_weight`.
+    - A typical workflow: start at `0.002`, halve or double until the flagged days match domain knowledge.
+
+    The detector works best when the rest of the model (seasonality, trend, exogenous variables) already explains normal variation well. Poor seasonal fit leads to the outlier component absorbing structured residuals.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+Outlier corrections are applied during both `fit` and `predict`. When predicting on future dates beyond the training window, corrections default to zero — the model falls back to the seasonal + exogenous + AR components only. This is the correct behaviour: the model should not extrapolate past anomalies into future predictions.
+</Warning>

@@ -1,0 +1,105 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "TSGAM Estimator",
+  "projectDescription": "A scikit-learn compatible Python library for time series load forecasting using Generalized Additive Models (GAMs) with Fourier seasonality, spline exogenous variables, trend, outlier detection, and autoregressive residual modeling.",
+  "theme": "luma",
+  "primaryColor": "#2563EB",
+  "lightColor": "#DBEAFE",
+  "darkColor": "#1E3A5F",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/model-components",
+              "guides/exogenous-variables",
+              "guides/trend-outliers",
+              "guides/autoregressive",
+              "guides/data-requirements"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/energy-forecasting",
+              "examples/air-quality",
+              "examples/solar-pv",
+              "examples/outlier-detection"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Estimator",
+            "pages": [
+              "api/tsgam-estimator",
+              "api/tsgam-estimator-config"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "api/multi-periodic-config",
+              "api/spline-linear-config",
+              "api/ar-config",
+              "api/trend-outlier-config",
+              "api/solver-config"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/utilities",
+              "api/constants"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-periodic Fourier basis functions for capturing daily, weekly, and yearly seasonal patterns",
+    "Cubic spline and linear exogenous variable support with lead/lag modeling",
+    "Optional trend term (none, linear, or nonlinear monotonic) constant per period",
+    "Sparse outlier detector for anomalous periods using L1 regularization",
+    "Autoregressive (AR) residual modeling with L1-constrained sparsity",
+    "scikit-learn compatible API (BaseEstimator, RegressorMixin)",
+    "Regularized convex optimization via CVXPY with CLARABEL solver",
+    "Automatic frequency inference from DatetimeIndex with gap tolerance",
+    "Weighted least squares support via sample_weight in fit()"
+  ],
+  "publicApiSurface": [
+    "TsgamEstimator",
+    "TsgamEstimatorConfig",
+    "TsgamMultiPeriodicConfig",
+    "TsgamSplineConfig",
+    "TsgamLinearConfig",
+    "TsgamArConfig",
+    "TsgamTrendConfig",
+    "TsgamOutlierConfig",
+    "TsgamSolverConfig",
+    "TrendType",
+    "get_recommended_periods",
+    "PERIOD_HOURLY_DAILY",
+    "PERIOD_HOURLY_WEEKLY",
+    "PERIOD_HOURLY_YEARLY",
+    "PERIOD_DAILY_YEARLY",
+    "PERIOD_WEEKLY_YEARLY",
+    "PERIOD_MONTHLY_YEARLY",
+    "PERIOD_QUARTERLY_YEARLY",
+    "PERIOD_YEARLY_YEARLY"
+  ]
+}

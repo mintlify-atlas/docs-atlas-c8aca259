@@ -1,0 +1,115 @@
+---
+title: "Utility functions"
+description: "Helper functions for configuring TSGAM models"
+---
+
+## get\_recommended\_periods
+
+```python
+get_recommended_periods(
+    X: pd.DataFrame,
+    include_harmonics: bool = False
+) -> list[float] | tuple[list[float], list[int]]
+```
+
+Infers the frequency of a time series and returns recommended Fourier periods (in hours) suited to that frequency. When `include_harmonics` is `True`, also returns a matched list of recommended harmonic counts ready for use with `TsgamMultiPeriodicConfig`.
+
+<Tip>
+  Use this function when you are unsure which periods to pass to
+  `TsgamMultiPeriodicConfig`. It removes the guesswork for standard frequencies
+  (sub-minute through weekly) and gives you a sensible starting point that you can
+  adjust from there.
+</Tip>
+
+### Parameters
+
+<ParamField path="X" type="pd.DataFrame" required>
+  Input data. Must have a `DatetimeIndex`, or its first column must contain
+  datetime values. At least 2 timestamps are required to infer the frequency.
+</ParamField>
+
+<ParamField path="include_harmonics" type="bool" default="False">
+  When `True`, the function returns a two-element tuple `(periods, num_harmonics)`
+  instead of only `periods`. The `num_harmonics` list is aligned with `periods`
+  and can be passed directly to `TsgamMultiPeriodicConfig`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="periods" type="list[float]">
+  Recommended periods expressed in hours. Each value is a multiple of the
+  inferred base time step, converted to hours. The set of multiples depends on
+  the detected frequency:
+
+  | Detected frequency | Multiples used |
+  | ------------------ | -------------- |
+  | Sub-minute         | 1, 5, 15, 60, 1440, 10080 × step |
+  | 1-minute           | 1, 5, 15, 60, 1440, 10080 × 1 min |
+  | 5-minute           | 1, 3, 12, 288, 2016 × 5 min |
+  | 15-minute          | 1, 4, 96, 672 × 15 min |
+  | Hourly             | 24, 168, 8766.18 hours (daily / weekly / yearly) |
+  | Daily              | 7, 365.2425 days |
+  | Weekly             | 52.1775 weeks |
+
+  Only returned alone when `include_harmonics=False`.
+</ResponseField>
+
+<ResponseField name="num_harmonics" type="list[int]">
+  Recommended number of Fourier harmonics for each period in `periods`. Higher
+  values capture more complex wave shapes for a given seasonality.
+
+  Only returned (as the second element of a tuple) when `include_harmonics=True`.
+</ResponseField>
+
+### Raises
+
+`ValueError` — raised in any of these situations:
+
+- `X` is not a `pd.DataFrame`.
+- `X` has neither a `DatetimeIndex` nor a datetime-typed first column.
+- Fewer than 2 timestamps are present.
+- Timestamps are irregular and no standard frequency can be inferred.
+
+---
+
+### Examples
+
+**Basic usage — get periods for hourly data**
+
+```python
+import pandas as pd
+import numpy as np
+from tsgam_estimator import get_recommended_periods, TsgamMultiPeriodicConfig
+
+dates = pd.date_range("2023-01-01", periods=8766, freq="h")
+X = pd.DataFrame({"value": np.random.randn(8766)}, index=dates)
+
+periods = get_recommended_periods(X)
+# periods → [24.0, 168.0, 8766.18]
+#             daily  weekly  yearly  (all in hours)
+
+config = TsgamMultiPeriodicConfig(
+    num_harmonics=[6, 4, 3],
+    periods=periods,
+)
+```
+
+**With harmonics — pass returned values directly to TsgamMultiPeriodicConfig**
+
+```python
+import pandas as pd
+import numpy as np
+from tsgam_estimator import get_recommended_periods, TsgamMultiPeriodicConfig
+
+dates = pd.date_range("2023-01-01", periods=52_416, freq="5min")
+X = pd.DataFrame({"value": np.random.randn(52_416)}, index=dates)
+
+periods, num_harmonics = get_recommended_periods(X, include_harmonics=True)
+# periods       → [0.0833, 0.25, 1.0, 24.0, 168.0]  (hours)
+# num_harmonics → [3, 3, 6, 4, 3]
+
+config = TsgamMultiPeriodicConfig(
+    num_harmonics=num_harmonics,
+    periods=periods,
+)
+```

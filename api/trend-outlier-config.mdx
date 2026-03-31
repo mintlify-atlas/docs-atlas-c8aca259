@@ -1,0 +1,115 @@
+---
+title: 'TsgamTrendConfig and TsgamOutlierConfig'
+description: 'Configuration for trend term and sparse outlier detection per period'
+---
+
+<Tabs>
+  <Tab title="TsgamTrendConfig">
+    `TsgamTrendConfig` controls the long-term trend component of the model. The trend is constant per period (e.g. per day for hourly data), allowing the model to capture slow drift across periods while keeping within-period variation explained by the seasonal and exogenous terms.
+
+    ## TrendType enum
+
+    `TrendType` is a `StrEnum` with the following values:
+
+    | Value | String | Description |
+    |---|---|---|
+    | `TrendType.NONE` | `'none'` | No trend (trend = 0) |
+    | `TrendType.LINEAR` | `'linear'` | Linear trend with constant slope |
+    | `TrendType.NONLINEAR` | `'nonlinear'` | Non-linear monotonic decreasing trend |
+
+    ## Parameters
+
+    <ParamField path="trend_type" type="TrendType" default="TrendType.NONE">
+      Type of trend to fit. Accepts `TrendType` enum values or their string equivalents (`'none'`, `'linear'`, `'nonlinear'`).
+    </ParamField>
+
+    <ParamField path="grouping" type="float | None" default="None">
+      Period length in hours over which the trend value is held constant. If `None`, defaults to 24 hours (daily) for hourly data. The trend assigns one constant value per period of this length.
+
+      Examples:
+      - Hourly data, daily trend: `24.0` (default)
+      - Hourly data, weekly trend: `168.0`
+      - 15-minute data, daily trend: `24.0` (96 samples per period)
+      - Daily data, yearly trend: `365.2425`
+    </ParamField>
+
+    <ParamField path="reg_weight" type="float" default="10.0">
+      Regularization weight for trend differences between adjacent periods. Higher values enforce a smoother trend. Typical range: `1.0` to `100.0`.
+    </ParamField>
+
+    ## Examples
+
+    ```python
+    from tsgam_estimator import TsgamTrendConfig, TrendType
+
+    # Linear daily trend for hourly data (default period)
+    config = TsgamTrendConfig(trend_type=TrendType.LINEAR)
+
+    # Non-linear trend at weekly granularity
+    config_weekly = TsgamTrendConfig(
+        trend_type=TrendType.NONLINEAR,
+        grouping=168.0,
+    )
+
+    # No trend
+    config_none = TsgamTrendConfig(trend_type=TrendType.NONE)
+    ```
+  </Tab>
+
+  <Tab title="TsgamOutlierConfig">
+    `TsgamOutlierConfig` adds a sparse outlier correction component to the model. The detector assigns one additive correction per period (e.g. per day). L1 regularization encourages most periods to have a correction of zero, so only genuinely anomalous periods receive a non-zero value.
+
+    This is useful for detecting holidays, special events, or data quality issues that produce an unusual pattern within an otherwise regular time series.
+
+    ## Parameters
+
+    <ParamField path="reg_weight" type="float" required>
+      L1 regularization weight controlling the sparsity of outlier detection. Higher values produce fewer detected outliers; lower values produce more.
+
+      | Sparsity level | Typical range |
+      |---|---|
+      | Very sparse (few outliers) | `0.01` to `0.1` |
+      | Moderate | `0.001` to `0.01` |
+      | More sensitive (more outliers) | `0.0001` to `0.001` |
+
+      Recommended starting point: `0.002`.
+    </ParamField>
+
+    <ParamField path="period_hours" type="float | None" default="None">
+      Period length in hours for which the outlier correction is constant. If `None`, defaults to `24.0` hours (daily outliers) for hourly data.
+
+      Examples:
+      - Hourly data, daily outliers: `24.0` (default)
+      - 15-minute data, daily outliers: `24.0` (96 samples per day)
+      - Hourly data, weekly outliers: `168.0`
+      - Daily data, weekly outliers: `7.0`
+    </ParamField>
+
+    ## Tuning guidance
+
+    Start with `reg_weight=0.002` and adjust as follows:
+
+    - If **more than ~10% of periods** are flagged as outliers, increase `reg_weight` to enforce sparsity.
+    - If **no outliers** are detected but anomalies are known to exist, decrease `reg_weight`.
+    - For most real-world datasets, values between `0.001` and `0.01` work well.
+
+    <Note>
+      For prediction periods beyond the training data, outlier corrections default to 0 (no correction is applied).
+    </Note>
+
+    ## Examples
+
+    ```python
+    from tsgam_estimator import TsgamOutlierConfig
+
+    # Daily outlier detector, moderate sparsity (recommended starting point)
+    config = TsgamOutlierConfig(reg_weight=0.002)
+
+    # Weekly outlier detector with high sparsity (only extreme anomalies)
+    config_weekly = TsgamOutlierConfig(reg_weight=0.01, period_hours=168.0)
+
+    # More sensitive daily detector (more outliers flagged)
+    config_sensitive = TsgamOutlierConfig(reg_weight=0.001)
+    ```
+  </Tab>
+</Tabs>

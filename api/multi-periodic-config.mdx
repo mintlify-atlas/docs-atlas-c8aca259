@@ -1,0 +1,55 @@
+---
+title: 'TsgamMultiPeriodicConfig'
+description: 'Configuration for multi-periodic Fourier basis functions for seasonal patterns'
+---
+
+`TsgamMultiPeriodicConfig` defines the seasonal and periodic patterns in a time series using Fourier basis functions. Each period can have multiple harmonics to capture complex seasonal shapes.
+
+## Parameters
+
+<ParamField path="num_harmonics" type="list[int]" required>
+  Number of harmonics for each period. Each element corresponds to a period in `periods`. For example, `[6, 4, 3]` means 6 harmonics for the first period, 4 for the second, and 3 for the third.
+</ParamField>
+
+<ParamField path="periods" type="list[float]" required>
+  Periods for each harmonic block, in hours. Must have the same length as `num_harmonics`. Common values:
+
+  - `24` — daily pattern
+  - `168` (`7 * 24`) — weekly pattern
+  - `8766` (`365.2425 * 24`) — yearly pattern
+</ParamField>
+
+<ParamField path="reg_weight" type="float" default="1e-4">
+  Regularization weight for Fourier coefficients. Higher values increase smoothness of the seasonal patterns. Typical range: `1e-5` to `1e-3`.
+</ParamField>
+
+<Note>
+  `num_harmonics` and `periods` must have the same length. Each element in `num_harmonics` corresponds to the element at the same index in `periods`.
+</Note>
+
+## Example
+
+Standard hourly configuration with daily, weekly, and yearly periodicity:
+
+```python
+from tsgam_estimator import TsgamMultiPeriodicConfig
+
+HOURLY_DAILY  = 24
+HOURLY_WEEKLY = 7 * 24          # 168
+HOURLY_YEARLY = 365.2425 * 24  # 8766
+
+config = TsgamMultiPeriodicConfig(
+    num_harmonics=[3, 4, 6],
+    periods=[HOURLY_YEARLY, HOURLY_WEEKLY, HOURLY_DAILY],
+)
+```
+
+To increase resolution of the daily pattern, raise its harmonic count:
+
+```python
+config = TsgamMultiPeriodicConfig(
+    num_harmonics=[3, 4, 12],
+    periods=[HOURLY_YEARLY, HOURLY_WEEKLY, HOURLY_DAILY],
+    reg_weight=1e-4,
+)
+```

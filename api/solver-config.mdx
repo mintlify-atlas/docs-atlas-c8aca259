@@ -1,0 +1,57 @@
+---
+title: 'TsgamSolverConfig'
+description: 'Configuration for the CVXPY convex optimization solver'
+---
+
+`TsgamSolverConfig` controls which CVXPY solver is used to solve the underlying convex optimization problem and whether solver output is printed during fitting.
+
+## Parameters
+
+<ParamField path="solver" type="str" default="CLARABEL">
+  CVXPY solver name. Common options:
+
+  | Solver | Characteristics |
+  |---|---|
+  | `'CLARABEL'` | Fast, modern solver — recommended for most use cases |
+  | `'ECOS'` | Reliable; slower than CLARABEL |
+  | `'OSQP'` | Well-suited for quadratic problems |
+  | `'SCS'` | General-purpose; good for large problems |
+</ParamField>
+
+<ParamField path="verbose" type="bool" default="true">
+  Whether to print solver output during optimization. Useful for debugging convergence issues. Set to `False` in production to suppress output.
+</ParamField>
+
+<Tip>
+  CLARABEL is recommended for most use cases. Switch to ECOS or SCS only if CLARABEL fails to find a solution or produces errors on your specific problem.
+</Tip>
+
+## Example
+
+```python
+from tsgam_estimator import TsgamSolverConfig
+
+# Default: CLARABEL with verbose output
+config = TsgamSolverConfig()
+
+# Production use: suppress output
+config_quiet = TsgamSolverConfig(solver='CLARABEL', verbose=False)
+
+# Alternative solver
+config_ecos = TsgamSolverConfig(solver='ECOS', verbose=True)
+```
+
+## Checking solver status
+
+After calling `fit()`, inspect `estimator.problem_.status` to verify the solution quality:
+
+```python
+estimator.fit(X, y)
+
+print(estimator.problem_.status)
+# Expected: 'optimal' or 'optimal_inaccurate'
+```
+
+<Note>
+  A status of `'optimal_inaccurate'` means the solver converged to a solution that may have slightly relaxed tolerances. Results are usually still usable. If you see `'infeasible'` or `'unbounded'`, check your configuration and data.
+</Note>

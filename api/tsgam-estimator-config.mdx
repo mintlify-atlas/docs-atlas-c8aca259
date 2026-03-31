@@ -1,0 +1,148 @@
+---
+title: 'TsgamEstimatorConfig'
+description: 'Main configuration dataclass combining all model component settings'
+---
+
+`TsgamEstimatorConfig` is the top-level configuration object passed to [`TsgamEstimator`](/api/tsgam-estimator). It combines all component configurations — seasonality, exogenous variables, trend, outlier detection, and autoregressive residuals — with solver settings and runtime options.
+
+<Tip>
+  Only `multi_periodic_config` and `exog_config` are required (though both accept `None`). All other fields have defaults and can be omitted when those components are not needed.
+</Tip>
+
+## Parameters
+
+<ParamField path="multi_periodic_config" type="TsgamMultiPeriodicConfig | None" required>
+  Configuration for multi-periodic Fourier basis functions. Defines the seasonal and periodic patterns in the time series using Fourier harmonics. If `None`, no time-based seasonal patterns are modeled.
+
+  See [`TsgamMultiPeriodicConfig`](/api/multi-periodic-config) for details.
+</ParamField>
+
+<ParamField path="exog_config" type="list[TsgamSplineConfig | TsgamLinearConfig] | None" required>
+  List of configurations for exogenous variables. Each element configures one exogenous column in `X` — the order must match the column order in the DataFrame passed to `fit` and `predict`. Use `TsgamSplineConfig` for non-linear (cubic spline) relationships and `TsgamLinearConfig` for linear relationships. If `None`, no exogenous variables are used.
+</ParamField>
+
+<ParamField path="ar_config" type="TsgamArConfig | None" default="None">
+  Configuration for autoregressive (AR) residual modeling. After the baseline model (Fourier + exogenous + trend) is fitted, an AR model is optionally fitted on the residuals to capture remaining temporal dependencies using L1-regularized optimization. If `None`, no AR model is fitted.
+
+  Access fitted AR coefficients at `estimator.ar_coef_` after calling `fit`.
+</ParamField>
+
+<ParamField path="trend_config" type="TsgamTrendConfig | None" default="None">
+  Configuration for a trend term. The trend is constant per period (for example, per day for hourly data) and can be `'linear'`, `'nonlinear'` (monotonic decreasing), or `'none'`. If `None`, no trend is fitted — equivalent to `TsgamTrendConfig(trend_type='none')`.
+</ParamField>
+
+<ParamField path="outlier_config" type="TsgamOutlierConfig | None" default="None">
+  Configuration for the outlier detector component. The detector assigns one sparse additive correction per period (for example, per day). L1 regularization encourages sparsity: most periods receive no correction, while anomalous periods receive a non-zero correction. The correction is additive in log space, which translates to a multiplicative effect in the original scale.
+
+  If `None`, no outlier detection is performed. See `TsgamOutlierConfig` for parameter tuning guidelines.
+</ParamField>
+
+<ParamField path="solver_config" type="TsgamSolverConfig" default="TsgamSolverConfig()">
+  Solver settings for the CVXPY optimization. Defaults to `TsgamSolverConfig()`, which uses the CLARABEL solver with verbose output. Override to change the solver or suppress output.
+
+  ```python
+  from tsgam_estimator import TsgamSolverConfig
+
+  solver_config = TsgamSolverConfig(solver="CLARABEL", verbose=False)
+  ```
+</ParamField>
+
+<ParamField path="sort_index" type="bool" default="True">
+  Controls how the datetime index is handled before fitting or predicting.
+
+  - `True` — automatically sort `X` (and `y`, `sample_weight` during `fit`) by the datetime index so that row order matches time order.
+  - `False` — require the index to already be sorted chronologically; raises `ValueError` if it is not.
+</ParamField>
+
+<ParamField path="random_state" type="RandomState | None" default="None">
+  Random state for reproducible results. Used when `ar_config` is provided and `sample()` is called to generate AR noise rollout. Accepts `numpy.random.RandomState`, an integer seed, or `None` for non-reproducible results.
+</ParamField>
+
+<ParamField path="debug" type="bool" default="False">
+  When `True`, `fit` stores additional attributes on the estimator for inspection:
+
+  - `_baseline_residuals_` — residuals after fitting the baseline model, before AR
+  - `_B_running_view_` — the AR design matrix (running window view of residuals)
+  - `_ar_valid_mask_` — boolean mask for valid AR training samples
+
+  Disable in production to avoid holding references to large intermediate arrays.
+</ParamField>
+
+## Example
+
+Full configuration using all optional components:
+
+```python
+import numpy as np
+import pandas as pd
+from tsgam_estimator import (
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamSplineConfig,
+    TsgamLinearConfig,
+    TsgamArConfig,
+    TsgamTrendConfig,
+    TsgamOutlierConfig,
+    TsgamSolverConfig,
+    TsgamEstimator,
+)
+from numpy.random import RandomState
+
+# Fourier seasonal patterns: yearly, weekly, daily
+multi_periodic = TsgamMultiPeriodicConfig(
+    num_harmonics=[6, 4, 3],
+    periods=[365.2425 * 24, 7 * 24, 24],
+)
+
+# Exogenous variables: one spline variable and one linear variable
+exog_config = [
+    TsgamSplineConfig(
+        n_knots=10,
+        lags=[-1, 0, 1],
+        reg_weight=1e-4,
+        diff_reg_weight=1.0,
+    ),
+    TsgamLinearConfig(
+        lags=[0],
+        reg_weight=1e-4,
+    ),
+]
+
+# AR(1) residual model
+ar_config = TsgamArConfig(lags=[1], l1_constraint=0.95)
+
+# Daily linear trend
+trend_config = TsgamTrendConfig(trend_type="linear")
+
+# Daily outlier detector (moderate sparsity)
+outlier_config = TsgamOutlierConfig(reg_weight=0.002, period_hours=24.0)
+
+# Solver: CLARABEL, silent output
+solver_config = TsgamSolverConfig(solver="CLARABEL", verbose=False)
+
+config = TsgamEstimatorConfig(
+    multi_periodic_config=multi_periodic,
+    exog_config=exog_config,
+    ar_config=ar_config,
+    trend_config=trend_config,
+    outlier_config=outlier_config,
+    solver_config=solver_config,
+    sort_index=True,
+    random_state=RandomState(42),
+    debug=False,
+)
+
+estimator = TsgamEstimator(config=config)
+```
+
+For a minimal configuration with only seasonality and no exogenous variables:
+
+```python
+config = TsgamEstimatorConfig(
+    multi_periodic_config=TsgamMultiPeriodicConfig(
+        num_harmonics=[6, 4, 3],
+        periods=[365.2425 * 24, 7 * 24, 24],
+    ),
+    exog_config=None,
+)
+```

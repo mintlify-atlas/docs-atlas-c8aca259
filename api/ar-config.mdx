@@ -1,0 +1,41 @@
+---
+title: 'TsgamArConfig'
+description: 'Configuration for autoregressive modeling of GAM residuals'
+---
+
+`TsgamArConfig` enables fitting an autoregressive (AR) model on the residuals of the baseline GAM (Fourier + exogenous components). This captures remaining temporal dependencies that the seasonal and exogenous terms do not explain.
+
+The AR model uses an L1 norm constraint on coefficients to encourage sparsity — only the most predictive lags retain non-zero weights.
+
+## Parameters
+
+<ParamField path="lags" type="list[int]" required>
+  AR lags to include in the model. Only positive integers are meaningful (looking back in time). Common choices:
+
+  - `[1]` — AR(1): depends only on the immediately preceding residual
+  - `[1, 2]` — AR(2): depends on the two most recent residuals
+  - `[1, 24]` — seasonal AR: depends on the previous hour and the same hour yesterday
+</ParamField>
+
+<ParamField path="l1_constraint" type="float" default="0.95">
+  L1 norm constraint on AR coefficients. Controls sparsity — lower values allow fewer non-zero coefficients. Typical range: `0.5` to `1.0`.
+</ParamField>
+
+<Note>
+  The AR fitting step is always unweighted, even when `sample_weight` is passed to `fit()`. Sample weights apply only to the GAM component.
+</Note>
+
+## Examples
+
+```python
+from tsgam_estimator import TsgamArConfig
+
+# AR(1): model residuals as a function of the previous time step
+ar1 = TsgamArConfig(lags=[1])
+
+# AR(2): include the two most recent residuals
+ar2 = TsgamArConfig(lags=[1, 2], l1_constraint=0.8)
+
+# Seasonal AR for hourly data: previous hour + same hour yesterday
+ar_seasonal = TsgamArConfig(lags=[1, 24], l1_constraint=0.95)
+```

@@ -1,0 +1,316 @@
+---
+title: "Air quality forecasting"
+description: "Forecast PM2.5 air quality index using exogenous weather variables with spline basis functions"
+---
+
+This example demonstrates forecasting hourly PM2.5 concentrations using weather covariates as exogenous variables with cubic spline basis functions. The dataset is the publicly available Beijing PM2.5 dataset from the UCI ML Repository, covering four years (2010–2014) of hourly meteorological and air quality measurements.
+
+<CardGroup cols={2}>
+  <Card title="Dataset" icon="database">
+    Beijing PM2.5 (UCI ML Repository). Hourly records from 2010–2014 with columns: `pm25`, `temperature`, `dewpoint`, `pressure`, `wind_speed`, `snow_hours`, `rain_hours`.
+  </Card>
+  <Card title="Target" icon="chart-line">
+    PM2.5 concentration (μg/m³), log-transformed as `log(pm25 + 1.0)` before fitting to handle the skewed, right-tailed distribution.
+  </Card>
+  <Card title="Seasonality" icon="wave-square">
+    Multi-periodic Fourier basis: 8 yearly harmonics, 6 weekly harmonics, 4 daily harmonics — capturing Beijing's strong seasonal pollution cycle.
+  </Card>
+  <Card title="Ablation focus" icon="flask">
+    Exogenous variable ablation: compare seasonal-only vs. adding variables one at a time (`temperature` → `+ dewpoint` → `+ wind_speed` → all).
+  </Card>
+</CardGroup>
+
+<Note>
+PM2.5 is driven by complex meteorology. Temperature and dewpoint together capture atmospheric stability; wind speed represents dilution; pressure correlates with stagnant high-pressure systems that trap pollution. Adding variables one at a time reveals their individual contribution.
+</Note>
+
+## Prerequisites
+
+```python
+from tsgam_estimator import (
+    TsgamEstimator,
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamSplineConfig,
+    TsgamSolverConfig,
+    PERIOD_HOURLY_DAILY,
+    PERIOD_HOURLY_WEEKLY,
+    PERIOD_HOURLY_YEARLY,
+)
+import numpy as np
+import pandas as pd
+```
+
+## Workflow
+
+<Steps>
+  <Step title="Load and preprocess data">
+    Download from the UCI ML Repository and preprocess to a regular hourly index.
+
+    ```python
+    df = pd.read_csv("PRSA_data_2010.1.1-2014.12.31.csv")
+
+    # Build a proper datetime index from year/month/day/hour columns
+    df["datetime"] = pd.to_datetime(df[["year", "month", "day", "hour"]])
+    df = df.set_index("datetime")
+
+    # Rename to clean column names
+    df = df[["pm2.5", "TEMP", "DEWP", "PRES", "Iws"]].copy()
+    df.columns = ["pm25", "temperature", "dewpoint", "pressure", "wind_speed"]
+
+    # Filter physically implausible values
+    df = df[(df["pm25"] > 0)    | df["pm25"].isna()]
+    df = df[(df["pm25"] < 1000) | df["pm25"].isna()]
+
+    # Re-index to a regular hourly grid and interpolate short gaps
+    date_range = pd.date_range(
+        start=df.index.min().floor("h"),
+        end=df.index.max().floor("h"),
+        freq="h",
+    )
+    df = df.reindex(date_range)
+    df = df.interpolate(method="linear", limit_direction="both")
+    df = df.dropna()
+    ```
+  </Step>
+
+  <Step title="Create train/test split">
+    Use 2012–2013 for training and Q1 2014 for testing. This gives two full years of training data covering all seasonal cycles.
+
+    ```python
+    df_train = df["2012-01-01":"2013-12-31"].copy()
+    df_test  = df["2014-01-01":"2014-03-31"].copy()
+
+    # Log-transform the target
+    y_train = np.log(df_train["pm25"].values + 1.0)
+    y_test  = np.log(df_test["pm25"].values + 1.0)
+
+    # Build exogenous feature DataFrames with a DatetimeIndex
+    exog_cols = ["temperature", "dewpoint", "wind_speed", "pressure"]
+
+    X_train = pd.DataFrame({c: df_train[c].values for c in exog_cols}, index=df_train.index)
+    X_test  = pd.DataFrame({c: df_test[c].values  for c in exog_cols}, index=df_test.index)
+    ```
+  </Step>
+
+  <Step title="Configure the model">
+    Each exogenous variable gets its own `TsgamSplineConfig`. The list order must match the column order of `X_train`.
+
+    ```python
+    multi_periodic_config = TsgamMultiPeriodicConfig(
+        num_harmonics=[8, 6, 4],
+        periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+        reg_weight=6e-5,
+    )
+
+    # One TsgamSplineConfig per exogenous variable, in column order
+    exog_config = [
+        TsgamSplineConfig(
+            n_knots=12,
+            lags=[-2, -1, 0, 1, 2],   # temperature: leads and lags capture inversion effects
+            reg_weight=6e-5,
+            diff_reg_weight=0.5,
+        ),
+        TsgamSplineConfig(
+            n_knots=10,
+            lags=[-1, 0, 1],           # dewpoint
+            reg_weight=6e-5,
+            diff_reg_weight=0.5,
+        ),
+        TsgamSplineConfig(
+            n_knots=8,
+            lags=[0, 1],               # wind_speed: current and previous hour
+            reg_weight=6e-5,
+            diff_reg_weight=0.5,
+        ),
+        TsgamSplineConfig(
+            n_knots=8,
+            lags=[0],                  # pressure: contemporaneous only
+            reg_weight=6e-5,
+            diff_reg_weight=0.5,
+        ),
+    ]
+
+    config = TsgamEstimatorConfig(
+        multi_periodic_config=multi_periodic_config,
+        exog_config=exog_config,
+        ar_config=None,
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+        random_state=42,
+    )
+    ```
+
+    <Tip>
+    Negative `lags` are leads — the model can look ahead in the covariate sequence. Temperature leads of `[-2, -1]` capture how an incoming warm front predicts PM2.5 dispersion before it arrives. Use leads only when the covariate is available in advance at prediction time.
+    </Tip>
+  </Step>
+
+  <Step title="Fit and predict">
+    ```python
+    estimator = TsgamEstimator(config=config)
+    estimator.fit(X_train, y_train)
+
+    pred_log = estimator.predict(X_test)
+
+    # Back-transform to original scale for evaluation
+    pred_pm25 = np.exp(pred_log) - 1.0
+    true_pm25 = np.exp(y_test)  - 1.0
+    ```
+  </Step>
+
+  <Step title="Evaluate">
+    ```python
+    rmse = np.sqrt(np.mean((true_pm25 - pred_pm25) ** 2))
+    mae  = np.mean(np.abs(true_pm25 - pred_pm25))
+    mape = np.mean(np.abs((true_pm25 - pred_pm25) / (true_pm25 + 1.0))) * 100
+
+    print(f"RMSE: {rmse:.2f} μg/m³")
+    print(f"MAE:  {mae:.2f} μg/m³")
+    print(f"MAPE: {mape:.2f}%")
+    ```
+  </Step>
+</Steps>
+
+## Exogenous variable ablation
+
+Run the same seasonal backbone with progressively more weather variables to quantify each variable's marginal contribution.
+
+<Tabs>
+  <Tab title="Seasonal only">
+    ```python
+    # No exogenous variables — purely time-based seasonal patterns
+    config_seasonal = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[8, 6, 4],
+            periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=6e-5,
+        ),
+        exog_config=None,
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+        random_state=42,
+    )
+
+    # X has no feature columns — only the DatetimeIndex matters
+    X_train_empty = pd.DataFrame(index=X_train.index)
+    X_test_empty  = pd.DataFrame(index=X_test.index)
+
+    est = TsgamEstimator(config=config_seasonal)
+    est.fit(X_train_empty, y_train)
+    ```
+  </Tab>
+  <Tab title="+ Temperature">
+    ```python
+    config_temp = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[8, 6, 4],
+            periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=6e-5,
+        ),
+        exog_config=[
+            TsgamSplineConfig(n_knots=12, lags=[-2, -1, 0, 1, 2], reg_weight=6e-5, diff_reg_weight=0.5),
+        ],
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+        random_state=42,
+    )
+
+    est = TsgamEstimator(config=config_temp)
+    est.fit(X_train[["temperature"]], y_train)
+    ```
+  </Tab>
+  <Tab title="+ Dewpoint">
+    ```python
+    config_temp_dew = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[8, 6, 4],
+            periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=6e-5,
+        ),
+        exog_config=[
+            TsgamSplineConfig(n_knots=12, lags=[-2, -1, 0, 1, 2], reg_weight=6e-5, diff_reg_weight=0.5),  # temperature
+            TsgamSplineConfig(n_knots=10, lags=[-1, 0, 1],         reg_weight=6e-5, diff_reg_weight=0.5),  # dewpoint
+        ],
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+        random_state=42,
+    )
+
+    est = TsgamEstimator(config=config_temp_dew)
+    est.fit(X_train[["temperature", "dewpoint"]], y_train)
+    ```
+  </Tab>
+  <Tab title="+ Wind speed">
+    ```python
+    config_three = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[8, 6, 4],
+            periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=6e-5,
+        ),
+        exog_config=[
+            TsgamSplineConfig(n_knots=12, lags=[-2, -1, 0, 1, 2], reg_weight=6e-5, diff_reg_weight=0.5),  # temperature
+            TsgamSplineConfig(n_knots=10, lags=[-1, 0, 1],         reg_weight=6e-5, diff_reg_weight=0.5),  # dewpoint
+            TsgamSplineConfig(n_knots=8,  lags=[0, 1],             reg_weight=6e-5, diff_reg_weight=0.5),  # wind_speed
+        ],
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+        random_state=42,
+    )
+
+    est = TsgamEstimator(config=config_three)
+    est.fit(X_train[["temperature", "dewpoint", "wind_speed"]], y_train)
+    ```
+  </Tab>
+  <Tab title="All variables">
+    ```python
+    config_all = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[8, 6, 4],
+            periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=6e-5,
+        ),
+        exog_config=[
+            TsgamSplineConfig(n_knots=12, lags=[-2, -1, 0, 1, 2], reg_weight=6e-5, diff_reg_weight=0.5),  # temperature
+            TsgamSplineConfig(n_knots=10, lags=[-1, 0, 1],         reg_weight=6e-5, diff_reg_weight=0.5),  # dewpoint
+            TsgamSplineConfig(n_knots=8,  lags=[0, 1],             reg_weight=6e-5, diff_reg_weight=0.5),  # wind_speed
+            TsgamSplineConfig(n_knots=8,  lags=[0],                reg_weight=6e-5, diff_reg_weight=0.5),  # pressure
+        ],
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+        random_state=42,
+    )
+
+    est = TsgamEstimator(config=config_all)
+    est.fit(X_train, y_train)
+    ```
+  </Tab>
+</Tabs>
+
+<AccordionGroup>
+  <Accordion title="TsgamLinearConfig as a lightweight alternative">
+    For variables you expect to have a roughly linear effect on log-PM2.5, use `TsgamLinearConfig` instead of `TsgamSplineConfig`. It uses fewer parameters and fits faster:
+
+    ```python
+    from tsgam_estimator import TsgamLinearConfig
+
+    exog_config = [
+        TsgamSplineConfig(n_knots=12, lags=[-2, -1, 0, 1, 2], reg_weight=6e-5, diff_reg_weight=0.5),  # temperature (nonlinear)
+        TsgamLinearConfig(lags=[-1, 0, 1], reg_weight=6e-5, diff_reg_weight=0.5),                      # dewpoint (approx. linear)
+        TsgamSplineConfig(n_knots=8, lags=[0, 1], reg_weight=6e-5, diff_reg_weight=0.5),               # wind_speed (nonlinear)
+    ]
+    ```
+  </Accordion>
+  <Accordion title="Handling missing data in covariates">
+    The Beijing dataset has missing PM2.5 and weather values that are filled by linear interpolation before fitting. If you skip interpolation and pass NaNs in `X_train`, the estimator will mask those rows automatically during fit. However, `predict` requires no NaNs in `X_test`.
+  </Accordion>
+  <Accordion title="Interpreting spline coefficients">
+    The spline basis for each variable expands each column of `X` into `n_knots + 3` features (cubic B-spline). The fitted coefficients are not directly interpretable as a slope — instead, inspect the shape by evaluating the fitted response at a grid of input values:
+
+    ```python
+    # Evaluate temperature response over its observed range
+    temp_grid = np.linspace(
+        X_train["temperature"].min(),
+        X_train["temperature"].max(),
+        200,
+    )
+    X_grid = pd.DataFrame({"temperature": temp_grid}, index=pd.date_range("2013-01-01", periods=200, freq="h"))
+    response = estimator.predict(X_grid)
+    ```
+  </Accordion>
+</AccordionGroup>

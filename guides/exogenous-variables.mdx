@@ -1,0 +1,243 @@
+---
+title: "Exogenous variables"
+description: "Configure spline and linear exogenous variable terms with lead/lag offsets"
+---
+
+Exogenous variables let the model learn how external drivers — temperature, price, calendar features, etc. — affect the target. Each variable is represented by a basis function (cubic spline or linear) and can incorporate **lead/lag offsets** to capture delayed or anticipatory effects.
+
+---
+
+## Choosing between spline and linear
+
+<Tabs>
+  <Tab title="TsgamSplineConfig — non-linear relationship">
+    Use when the effect of the variable is non-linear. For example, energy
+    demand typically increases sharply below 15 °C and above 25 °C, with a
+    relatively flat region in between.
+
+    ```python
+    from tsgam_estimator import TsgamSplineConfig
+
+    temp_config = TsgamSplineConfig(
+        n_knots=10,               # 10 evenly spaced knots
+        lags=[-1, 0, 1],          # 1-hour lead, current, 1-hour lag
+        reg_weight=1.0e-4,
+        diff_reg_weight=1.0,
+    )
+    ```
+  </Tab>
+  <Tab title="TsgamLinearConfig — linear relationship">
+    Use when the relationship is expected to be approximately linear, or when
+    you want a simpler, lower-parameter model (e.g., a price signal with a
+    direct proportional effect).
+
+    ```python
+    from tsgam_estimator import TsgamLinearConfig
+
+    price_config = TsgamLinearConfig(
+        lags=[-2, -1, 0, 1, 2],  # 2-hour window around current time
+        reg_weight=1.0e-4,
+        diff_reg_weight=1.0,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+When uncertain, start with `TsgamSplineConfig`. If the fitted spline curve is nearly straight after training, switch to `TsgamLinearConfig` to reduce the number of parameters.
+</Tip>
+
+---
+
+## Knot placement for splines
+
+Knots define where the spline changes behaviour. You can let the library place them automatically or specify them explicitly.
+
+<Tabs>
+  <Tab title="Automatic knots (n_knots)">
+    Knots are placed uniformly between the minimum and maximum of the training
+    variable. This is the simplest approach and works well in most cases.
+
+    ```python
+    config = TsgamSplineConfig(
+        n_knots=10,    # 10 evenly spaced knots from min to max of training data
+        lags=[0],
+    )
+    ```
+
+    The computed knots are stored in `estimator.exog_knots_` after fitting and
+    are reused during `predict()`.
+  </Tab>
+  <Tab title="Explicit knots">
+    Specify exact knot positions when you have domain knowledge about where the
+    non-linearity occurs, or when you want identical knots across experiments.
+
+    ```python
+    config = TsgamSplineConfig(
+        knots=[0, 5, 10, 15, 20, 25, 30, 35, 40],  # temperature breakpoints in °C
+        lags=[0],
+    )
+    ```
+
+    When `knots` is non-empty, `n_knots` is ignored.
+  </Tab>
+</Tabs>
+
+<Note>
+`n_knots` and `knots` are mutually exclusive. If `knots` is a non-empty list or array, `n_knots` is ignored. If `knots` is empty (`[]`), `n_knots` must be provided.
+</Note>
+
+---
+
+## Lead and lag offsets
+
+The `lags` parameter controls which time-shifted versions of the variable are included as model features.
+
+| Lag value | Meaning | Typical use case |
+|-----------|---------|-----------------|
+| `0` | Current time step | Direct effect |
+| `1`, `2`, … | Look **back** (positive = lag) | Thermal inertia, delayed response |
+| `-1`, `-2`, … | Look **forward** (negative = lead) | Forecast driver known ahead of time |
+
+```python
+# Include 3 hours of forecast temperature and 3 hours of observed temperature
+config = TsgamSplineConfig(
+    n_knots=10,
+    lags=[-3, -2, -1, 0, 1, 2, 3],
+)
+```
+
+<Warning>
+At training time, rows where lead/lag values cannot be computed (boundaries of the series) produce `NaN` in the basis matrices. These rows are **masked out** automatically during `fit()` via `combined_valid_mask_`. The model trains on the remaining valid samples only.
+</Warning>
+
+### Visualising the lag structure
+
+For a series of length `n` with `lags=[-2, -1, 0, 1, 2]`:
+
+- Rows `0` and `1` are masked (no history for lags `+1` and `+2`)
+- Rows `n-2` and `n-1` are masked (no future for leads `-1` and `-2`)
+- Rows `2` to `n-3` are valid and used for training
+
+---
+
+## Regularization parameters
+
+### `reg_weight`
+
+Penalizes the L2 norm of the basis coefficients. Larger values shrink coefficients toward zero, reducing the model's sensitivity to the exogenous variable.
+
+- **Default:** `1.0e-4`
+- **Typical range:** `1e-5` to `1e-3`
+- **Increase if:** The fitted curve is unrealistically wiggly or the model overfits.
+- **Decrease if:** The model underestimates the variable's effect.
+
+### `diff_reg_weight`
+
+Penalizes differences between coefficients at adjacent lags. This encourages smooth, continuous transitions across the lag dimension — the effect of a 1-hour lag should not be drastically different from a 2-hour lag.
+
+- **Default:** `1.0`
+- **Increase:** forces lag coefficients to be nearly identical (effective pooling).
+- **Decrease:** allows each lag to fit independently.
+
+```python
+config = TsgamSplineConfig(
+    n_knots=10,
+    lags=[-3, -2, -1, 0, 1, 2, 3],
+    reg_weight=1.0e-4,      # coefficient shrinkage
+    diff_reg_weight=1.0,    # smoothness across lags
+)
+```
+
+---
+
+## Multiple exogenous variables
+
+`exog_config` is a **list** — one entry per column in `X`. The order of entries must match the column order of the DataFrame passed to `fit()` and `predict()`.
+
+```python
+import pandas as pd
+import numpy as np
+from tsgam_estimator import (
+    TsgamEstimator,
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamSplineConfig,
+    TsgamLinearConfig,
+    PERIOD_HOURLY_DAILY,
+    PERIOD_HOURLY_WEEKLY,
+    PERIOD_HOURLY_YEARLY,
+)
+
+dates = pd.date_range("2020-01-01", periods=8766, freq="h")
+
+# Column 0: temperature  →  TsgamSplineConfig (index 0)
+# Column 1: price        →  TsgamLinearConfig  (index 1)
+X = pd.DataFrame(
+    {
+        "temperature": np.random.randn(8766) * 10 + 15,
+        "price": np.random.rand(8766) * 50 + 20,
+    },
+    index=dates,
+)
+y = np.log(np.random.rand(8766) * 100 + 200)
+
+exog_config = [
+    TsgamSplineConfig(n_knots=10, lags=[-3, -2, -1, 0, 1, 2, 3]),  # temperature
+    TsgamLinearConfig(lags=[-1, 0, 1]),                              # price
+]
+
+config = TsgamEstimatorConfig(
+    multi_periodic_config=TsgamMultiPeriodicConfig(
+        num_harmonics=[6, 4, 3],
+        periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+    ),
+    exog_config=exog_config,
+)
+
+estimator = TsgamEstimator(config=config)
+estimator.fit(X, y)
+```
+
+<Warning>
+**Column order matters.** The `i`-th entry in `exog_config` is applied to the `i`-th column of `X`. If you add or reorder columns between `fit()` and `predict()`, predictions will be silently incorrect. Always keep the same column order.
+</Warning>
+
+---
+
+## Inspecting fitted coefficients
+
+After `fit()`, the fitted coefficient arrays are accessible via `estimator.variables_`:
+
+```python
+# Coefficients for the first exogenous variable: shape (basis_dim, num_lags)
+coef_0 = estimator.variables_["exog_coef_0"].value
+print(coef_0.shape)  # e.g. (9, 7) for n_knots=10 and 7 lags
+
+# Knots used for the first spline variable (auto-computed from training data)
+knots_0 = estimator.exog_knots_[0]
+```
+
+---
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="What if a forecast exogenous variable is not available at predict time?">
+    You must provide all exogenous variable values (including leads/lags) in the
+    `X` passed to `predict()`. If forecast values are unavailable, you can use
+    climatological averages or model-based forecasts as substitutes.
+  </Accordion>
+  <Accordion title="Can I mix spline and linear configs for different variables?">
+    Yes. `exog_config` is a plain Python list and can contain any mix of
+    `TsgamSplineConfig` and `TsgamLinearConfig` objects — one per column.
+  </Accordion>
+  <Accordion title="Can I include only lags and no current value?">
+    Yes. Set `lags=[1, 2, 3]` (omit `0`) to use only lagged values. The model
+    will not include the current-time exogenous value as a feature.
+  </Accordion>
+  <Accordion title="How does diff_reg_weight interact with a single lag?">
+    `diff_reg_weight` only applies when `len(lags) > 1`. With a single lag,
+    the diff regularization term is zero regardless of the weight value.
+  </Accordion>
+</AccordionGroup>

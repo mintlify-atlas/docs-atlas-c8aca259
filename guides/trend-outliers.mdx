@@ -1,0 +1,232 @@
+---
+title: "Trend and outlier detection"
+description: "Model long-term drift and detect anomalous periods using sparse L1 regularization"
+---
+
+Two optional components — `TsgamTrendConfig` and `TsgamOutlierConfig` — handle systematic drift and episodic anomalies respectively. Both operate at the period level (e.g., one value per day) rather than per sample.
+
+---
+
+## Trend component — `TsgamTrendConfig`
+
+The trend models **slow, long-term drift** in the level of the time series. It assigns one value per period (e.g., one value per day for hourly data). Adjacent period values are regularized to be similar, producing a smooth trend curve.
+
+### Trend types
+
+```python
+from tsgam_estimator import TsgamTrendConfig, TrendType
+
+# No trend (default)
+trend_off = TsgamTrendConfig(trend_type=TrendType.NONE)
+
+# Linear trend: constant slope across all periods
+trend_linear = TsgamTrendConfig(
+    trend_type=TrendType.LINEAR,
+    reg_weight=10.0,
+)
+
+# Non-linear monotonic decreasing trend
+trend_nonlinear = TsgamTrendConfig(
+    trend_type=TrendType.NONLINEAR,
+    reg_weight=10.0,
+)
+```
+
+| `TrendType` | Constraint | When to use |
+|-------------|------------|-------------|
+| `NONE` | No trend term added | Stationary data; no systematic drift |
+| `LINEAR` | Constant slope `cvxpy.diff(trend) == slope` | Steady linear growth or decline |
+| `NONLINEAR` | Monotonic decreasing `cvxpy.diff(trend) <= 0` | Decay processes (e.g., fleet retirement, degradation) |
+
+<Note>
+The first period's trend value is always constrained to zero (`trend[0] == 0`) so the constant intercept absorbs the baseline level and the trend represents pure change from that baseline.
+</Note>
+
+### `grouping` for trend
+
+`grouping` sets how long each trend "step" is, in hours. For hourly data the default is `24.0` (one trend value per day).
+
+```python
+from tsgam_estimator import TsgamTrendConfig, TrendType
+
+# One trend value per day (default for hourly data)
+daily_trend = TsgamTrendConfig(
+    trend_type=TrendType.LINEAR,
+    grouping=None,      # None → auto-inferred as 24.0 for hourly data
+)
+
+# One trend value per week for hourly data
+weekly_trend = TsgamTrendConfig(
+    trend_type=TrendType.NONLINEAR,
+    grouping=168.0,     # 7 × 24
+)
+```
+
+### `reg_weight` for trend
+
+`reg_weight` penalizes the sum of squared first differences between adjacent trend values (`cvxpy.sum_squares(cvxpy.diff(trend))`). Larger values force a smoother trend.
+
+- **Default:** `10.0`
+- **Typical range:** `1.0` to `100.0`
+- **Increase** if the fitted trend is too noisy or erratic.
+- **Decrease** if the trend cannot track real structural changes.
+
+### Accessing the fitted trend
+
+```python
+import numpy as np
+
+# Vector of one value per period
+trend_values = estimator.variables_["trend"].value
+print(f"Trend spans {len(trend_values)} periods")
+
+# For LINEAR trend, the slope is also available
+if estimator.config.trend_config.trend_type == TrendType.LINEAR:
+    slope = estimator.variables_["trend_slope"].value
+    print(f"Trend slope: {slope:.4f} per period")
+```
+
+---
+
+## Outlier detection — `TsgamOutlierConfig`
+
+The outlier detector assigns a **sparse additive correction** to each period. Because corrections are applied in log space (when the target is log-transformed), they correspond to multiplicative effects in the original scale. L1 regularization (`reg_weight * ||outlier||₁`) encourages most corrections to be exactly zero — only genuinely anomalous periods receive a non-zero value.
+
+<Note>
+Typical use cases for outlier detection include: public holidays, unusual weather events, data quality problems (e.g., meter failures), and one-off special events.
+</Note>
+
+### Configuration
+
+```python
+from tsgam_estimator import TsgamOutlierConfig
+
+# Daily outlier detector — moderate sensitivity (recommended starting point)
+outlier_config = TsgamOutlierConfig(
+    reg_weight=0.002,
+    period_hours=None,   # None → defaults to 24.0 hours (daily)
+)
+```
+
+### `reg_weight` sensitivity guide
+
+`reg_weight` is the L1 penalty coefficient. It directly controls how many periods are flagged as outliers.
+
+| `reg_weight` | Effect | When to use |
+|--------------|--------|-------------|
+| `0.0001` – `0.001` | Many corrections; sensitive to small deviations | Initial exploration |
+| `0.001` – `0.01` | Moderate; flags obvious anomalies | Most real-world datasets |
+| `0.01` – `0.1` | Sparse; only extreme outliers | Clean industrial data |
+
+<Tip>
+Start with `reg_weight=0.002`. If more than ~10% of periods have non-zero corrections, increase it. If no outliers are detected but you expect some (e.g., holidays), decrease it.
+</Tip>
+
+### `period_hours` for outliers
+
+```python
+# Daily outliers for hourly data (default)
+TsgamOutlierConfig(reg_weight=0.002, period_hours=24.0)
+
+# Weekly outliers for hourly data
+TsgamOutlierConfig(reg_weight=0.005, period_hours=168.0)
+
+# Daily outliers for 15-minute data
+TsgamOutlierConfig(reg_weight=0.002, period_hours=24.0)  # 96 samples per period
+```
+
+### Inspecting detected outliers
+
+After `fit()`, use `estimator.variables_["outlier"].value` to access the per-period correction vector.
+
+```python
+import numpy as np
+
+outlier_values = estimator.variables_["outlier"].value
+
+# Count how many periods have a significant correction
+significant = np.abs(outlier_values) > 0.05
+print(f"Detected {significant.sum()} outlier periods out of {len(outlier_values)}")
+
+# Find the most extreme corrections
+top_outliers = np.argsort(np.abs(outlier_values))[::-1][:10]
+print("Top 10 outlier period indices:", top_outliers)
+print("Their correction values:", outlier_values[top_outliers])
+```
+
+<Warning>
+Outlier corrections are learned only for periods present in the **training data**. For any prediction period beyond the training window, the correction defaults to `0` (no anomaly). Do not rely on this component to extrapolate known holiday effects into the future — use exogenous indicator variables for that purpose instead.
+</Warning>
+
+---
+
+## Using trend and outliers together
+
+```python
+from tsgam_estimator import (
+    TsgamEstimator,
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamSplineConfig,
+    TsgamTrendConfig,
+    TsgamOutlierConfig,
+    TrendType,
+    PERIOD_HOURLY_DAILY,
+    PERIOD_HOURLY_WEEKLY,
+    PERIOD_HOURLY_YEARLY,
+)
+
+config = TsgamEstimatorConfig(
+    multi_periodic_config=TsgamMultiPeriodicConfig(
+        num_harmonics=[6, 4, 3],
+        periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+    ),
+    exog_config=[
+        TsgamSplineConfig(n_knots=10, lags=[-3, -2, -1, 0, 1, 2, 3]),
+    ],
+    trend_config=TsgamTrendConfig(
+        trend_type=TrendType.LINEAR,
+        grouping=None,       # auto: 24h per period for hourly data
+        reg_weight=10.0,
+    ),
+    outlier_config=TsgamOutlierConfig(
+        reg_weight=0.002,
+        period_hours=None,   # auto: 24h per period
+    ),
+)
+
+estimator = TsgamEstimator(config=config)
+estimator.fit(X_train, y_train)
+```
+
+---
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="What is the difference between trend and outlier components?">
+    The **trend** captures smooth, predictable drift — it is regularized to
+    change slowly and consistently across periods. The **outlier detector**
+    captures sudden, sparse anomalies — most periods have exactly zero
+    correction, with only a handful flagged. Use the trend for systematic
+    changes and the outlier detector for episodic events.
+  </Accordion>
+  <Accordion title="Can I use both LINEAR trend and outlier detection simultaneously?">
+    Yes. The two components are additive and independent. The optimizer jointly
+    fits both while respecting the L1 sparsity constraint on the outlier term
+    and the difference smoothness constraint on the trend.
+  </Accordion>
+  <Accordion title="Why does trend[0] == 0?">
+    This anchors the trend baseline to zero so that the constant intercept
+    term absorbs the overall mean level. Without this constraint the trend
+    and constant would be unidentifiable (many combinations of values would
+    give the same predictions).
+  </Accordion>
+  <Accordion title="What is the matrix T in the outlier formulation?">
+    `T` is a binary matrix of shape `(n_samples, n_periods)`. Row `i` has a
+    `1` in the column corresponding to the period that sample `i` falls in.
+    The outlier term is `T @ outlier_vector`. The stored matrix
+    `estimator.outlier_T_matrix_` is only used during `fit()`; during
+    `predict()` a new T matrix is constructed from the prediction timestamps.
+  </Accordion>
+</AccordionGroup>

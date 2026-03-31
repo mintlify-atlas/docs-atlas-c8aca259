@@ -1,0 +1,299 @@
+---
+title: "Energy demand forecasting"
+description: "Forecast hourly electricity demand using multi-periodic Fourier seasonality, weather exogenous variables, and AR residuals"
+---
+
+This example walks through forecasting Los Angeles hourly electricity demand using TSGAM. The dataset covers 2018 and includes weather covariates — temperature, humidity, and solar irradiance — from the same location.
+
+<CardGroup cols={2}>
+  <Card title="Dataset" icon="database">
+    LA hourly electricity demand (2018) merged with weather data: `temperature_degF`, `humidity_pc`, `global_Wpms`, `direct_Wpms`, `diffuse_Wpms`.
+  </Card>
+  <Card title="Validation strategy" icon="split">
+    Training with gaps: hold out the last 7 days of every month for validation, creating 12 non-contiguous test windows spread across the year.
+  </Card>
+  <Card title="Seasonality" icon="wave-square">
+    Multi-periodic Fourier basis covering daily (24 h), weekly (168 h), and yearly (8 766 h) cycles simultaneously.
+  </Card>
+  <Card title="Components" icon="layers">
+    Harmonics → exogenous splines → AR residuals → outlier corrections. Each layer is evaluated in an ablation study.
+  </Card>
+</CardGroup>
+
+<Note>
+The model operates in log space. Apply `np.log(y + 1.0)` before fitting and `np.exp(pred) - 1.0` to recover predictions in MW. This stabilises variance and lets the outlier detector work multiplicatively.
+</Note>
+
+## Prerequisites
+
+```python
+from tsgam_estimator import (
+    TsgamEstimator,
+    TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig,
+    TsgamSplineConfig,
+    TsgamArConfig,
+    TsgamOutlierConfig,
+    TsgamSolverConfig,
+    PERIOD_HOURLY_DAILY,
+    PERIOD_HOURLY_WEEKLY,
+    PERIOD_HOURLY_YEARLY,
+)
+import numpy as np
+import pandas as pd
+```
+
+## Workflow
+
+<Steps>
+  <Step title="Load and merge data">
+    Load the hourly weather CSV and the hourly energy CSV, parse timestamps, and join on the datetime index.
+
+    ```python
+    df_weather = pd.read_csv("weather_CA_Los Angeles.csv")
+    df_weather["timestamp"] = pd.to_datetime(df_weather["timestamp"])
+    df_weather = df_weather.set_index("timestamp")
+
+    df_energy = pd.read_csv("CA_Los Angeles_R.csv")
+    df_energy["timestamp"] = pd.to_datetime(df_energy["timestamp"])
+    df_energy = df_energy.set_index("timestamp")
+
+    df = pd.merge(df_weather, df_energy, left_index=True, right_index=True, how="inner")
+    df = df.sort_index()
+
+    target = "elec_total_MW"
+    df = df.loc[~df[target].isna()]
+    ```
+
+    The merged frame contains weather columns (`temperature_degF`, `humidity_pc`, `global_Wpms`, `direct_Wpms`, `diffuse_Wpms`) alongside the energy target.
+  </Step>
+
+  <Step title="Create train/test split with gaps">
+    Because we only have one year of data, a simple chronological split would not cover all seasons in the test set. Instead, hold out the **last 7 days of every month** so the model is evaluated on every month of the year.
+
+    ```python
+    from datetime import timedelta
+
+    def create_gapped_split(df, holdout_days=7):
+        """Hold out the last N days of each calendar month."""
+        train_mask = pd.Series(True, index=df.index)
+        test_mask  = pd.Series(False, index=df.index)
+
+        df_copy = df.copy()
+        df_copy["year_month"] = df_copy.index.to_period("M")
+
+        for ym in df_copy["year_month"].unique():
+            month_data = df_copy[df_copy["year_month"] == ym]
+            if len(month_data) == 0:
+                continue
+            month_end = month_data.index.max()
+            holdout_start = (month_end - timedelta(days=holdout_days - 1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            mask = (
+                (df.index >= holdout_start)
+                & (df.index <= month_end)
+                & (df_copy["year_month"] == ym)
+            )
+            test_mask[mask]  = True
+            train_mask[mask] = False
+
+        return train_mask, test_mask
+
+    train_mask, test_mask = create_gapped_split(df, holdout_days=7)
+    df_train = df[train_mask]
+    df_test  = df[test_mask]
+    ```
+
+    <Info>
+    `TsgamEstimator.fit` accepts a sparse, non-contiguous `X` with a `DatetimeIndex` — there is no requirement for the training data to be a contiguous block. Gaps are handled automatically by the estimator.
+    </Info>
+
+    ```python
+    exog_cols = ["temperature_degF", "humidity_pc", "global_Wpms", "direct_Wpms", "diffuse_Wpms"]
+
+    X_train = df_train[exog_cols].copy()
+    X_test  = df_test[exog_cols].copy()
+
+    # Log-transform the target
+    y_train = np.log(df_train[target].values + 1.0)
+    y_test  = df_test[target].values          # kept in MW for evaluation
+    ```
+  </Step>
+
+  <Step title="Configure the model">
+    Build configs for each component. Each weather variable gets its own `TsgamSplineConfig`; the list order must match the column order of `X_train`.
+
+    ```python
+    multi_periodic_config = TsgamMultiPeriodicConfig(
+        num_harmonics=[4, 4, 6],
+        periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+        reg_weight=6e-5,
+    )
+
+    exog_config = [
+        TsgamSplineConfig(n_knots=10, lags=[0, 1, 2, 3], reg_weight=6e-5, diff_reg_weight=0.5),  # temperature_degF
+        TsgamSplineConfig(n_knots=8,  lags=[0, 1, 2],    reg_weight=6e-5, diff_reg_weight=0.5),  # humidity_pc
+        TsgamSplineConfig(n_knots=8,  lags=[0, 1],       reg_weight=6e-5, diff_reg_weight=0.5),  # global_Wpms
+        TsgamSplineConfig(n_knots=8,  lags=[0, 1],       reg_weight=6e-5, diff_reg_weight=0.5),  # direct_Wpms
+        TsgamSplineConfig(n_knots=8,  lags=[0, 1],       reg_weight=6e-5, diff_reg_weight=0.5),  # diffuse_Wpms
+    ]
+
+    ar_config = TsgamArConfig(lags=[1, 2, 3, 4], l1_constraint=0.97)
+
+    solver_config = TsgamSolverConfig(solver="CLARABEL", verbose=False)
+
+    config = TsgamEstimatorConfig(
+        multi_periodic_config=multi_periodic_config,
+        exog_config=exog_config,
+        ar_config=ar_config,
+        outlier_config=None,          # add TsgamOutlierConfig to detect anomalous days
+        solver_config=solver_config,
+        random_state=42,
+    )
+    ```
+
+    <Tip>
+    Positive `lags` look backward in time. `lags=[0, 1, 2, 3]` for temperature means the model sees the current hour plus the 3 preceding hours — useful because thermal load responds to recent temperature history.
+    </Tip>
+  </Step>
+
+  <Step title="Fit and predict">
+    ```python
+    estimator = TsgamEstimator(config=config)
+    estimator.fit(X_train, y_train)
+
+    # Predict requires a contiguous DatetimeIndex (no gaps)
+    pred_log = estimator.predict(X_test)
+    pred_mw  = np.exp(pred_log) - 1.0
+    ```
+
+    <Warning>
+    `predict` requires a **strictly regular** timestamp index with no gaps. The training data may have gaps, but the prediction index must be evenly spaced at the same frequency as training.
+    </Warning>
+  </Step>
+
+  <Step title="Evaluate">
+    ```python
+    from sklearn.metrics import mean_absolute_error, r2_score
+    import numpy as np
+
+    rmse = np.sqrt(np.mean((y_test - pred_mw) ** 2))
+    mae  = mean_absolute_error(y_test, pred_mw)
+    mape = np.mean(np.abs((y_test - pred_mw) / y_test)) * 100
+    r2   = r2_score(y_test, pred_mw)
+
+    print(f"RMSE: {rmse:.1f} MW")
+    print(f"MAE:  {mae:.1f} MW")
+    print(f"MAPE: {mape:.2f}%")
+    print(f"R²:   {r2:.4f}")
+    ```
+  </Step>
+</Steps>
+
+## Ablation study
+
+The recommended way to understand each component's contribution is to run an ablation study that builds up complexity step by step.
+
+<Tabs>
+  <Tab title="Step 1: Harmonics only">
+    ```python
+    config_harmonics = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[4, 4, 6],
+            periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=6e-5,
+        ),
+        exog_config=None,
+        ar_config=None,
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+    )
+    ```
+
+    Captures the average daily, weekly, and yearly energy profile. Provides a strong baseline for structured demand patterns.
+  </Tab>
+  <Tab title="Step 2: + Exogenous">
+    ```python
+    config_exog = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[4, 4, 6],
+            periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=6e-5,
+        ),
+        exog_config=[
+            TsgamSplineConfig(n_knots=10, lags=[0, 1, 2, 3], reg_weight=6e-5, diff_reg_weight=0.5),
+            TsgamSplineConfig(n_knots=8,  lags=[0, 1, 2],    reg_weight=6e-5, diff_reg_weight=0.5),
+        ],
+        ar_config=None,
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+    )
+    ```
+
+    Adding weather splines typically gives the largest accuracy gain for energy data, especially for summer cooling load.
+  </Tab>
+  <Tab title="Step 3: + AR">
+    ```python
+    config_ar = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[4, 4, 6],
+            periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=6e-5,
+        ),
+        exog_config=[
+            TsgamSplineConfig(n_knots=10, lags=[0, 1, 2, 3], reg_weight=6e-5, diff_reg_weight=0.5),
+            TsgamSplineConfig(n_knots=8,  lags=[0, 1, 2],    reg_weight=6e-5, diff_reg_weight=0.5),
+        ],
+        ar_config=TsgamArConfig(lags=[1, 2, 3, 4], l1_constraint=0.97),
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+    )
+    ```
+
+    AR residual modeling captures short-term serial correlation — typical gains are 5–15% on RMSE for hourly energy data.
+  </Tab>
+  <Tab title="Step 4: + Outlier">
+    ```python
+    config_outlier = TsgamEstimatorConfig(
+        multi_periodic_config=TsgamMultiPeriodicConfig(
+            num_harmonics=[4, 4, 6],
+            periods=[PERIOD_HOURLY_YEARLY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_DAILY],
+            reg_weight=6e-5,
+        ),
+        exog_config=[
+            TsgamSplineConfig(n_knots=10, lags=[0, 1, 2, 3], reg_weight=6e-5, diff_reg_weight=0.5),
+            TsgamSplineConfig(n_knots=8,  lags=[0, 1, 2],    reg_weight=6e-5, diff_reg_weight=0.5),
+        ],
+        ar_config=TsgamArConfig(lags=[1, 2, 3, 4], l1_constraint=0.97),
+        outlier_config=TsgamOutlierConfig(reg_weight=1e-4, period_hours=24.0),
+        solver_config=TsgamSolverConfig(solver="CLARABEL", verbose=False),
+    )
+    ```
+
+    Adding an outlier detector helps the model handle holidays and anomalous demand days without corrupting the seasonal fit.
+  </Tab>
+</Tabs>
+
+<AccordionGroup>
+  <Accordion title="Choosing the number of harmonics">
+    `num_harmonics` controls how many sine/cosine pairs are used per period. More harmonics means a more flexible seasonal profile but higher risk of overfitting:
+
+    - **Yearly** (`PERIOD_HOURLY_YEARLY`): 4–6 harmonics are usually sufficient to capture seasonal swings.
+    - **Weekly** (`PERIOD_HOURLY_WEEKLY`): 3–5 harmonics to distinguish weekday/weekend profiles.
+    - **Daily** (`PERIOD_HOURLY_DAILY`): 6–10 harmonics for the detailed intra-day shape.
+
+    Setting a harmonic count to `0` disables that period entirely (useful in ablation studies).
+  </Accordion>
+  <Accordion title="Choosing spline knots and lags">
+    `n_knots` for temperature is typically 8–12 because the demand–temperature relationship is nonlinear (cooling load kicks in above ~75 °F). For humidity and irradiance, 6–8 knots are usually sufficient.
+
+    `lags` for temperature should include at least `[0, 1, 2]` to capture thermal inertia — buildings take time to heat up. Solar irradiance has essentially no lag, so `[0, 1]` is typically enough.
+  </Accordion>
+  <Accordion title="Log-transform rationale">
+    Electricity demand is strictly positive and roughly log-normally distributed. Fitting in log space:
+
+    - Stabilises variance across the day (no heteroscedasticity)
+    - Allows the outlier detector to model multiplicative corrections (holidays might shift demand by ±20%)
+    - Avoids the model predicting negative demand
+
+    Apply `np.log(y + 1.0)` (soft-plus) rather than `np.log(y)` to handle near-zero values in some datasets. Invert with `np.exp(pred) - 1.0`.
+  </Accordion>
+</AccordionGroup>

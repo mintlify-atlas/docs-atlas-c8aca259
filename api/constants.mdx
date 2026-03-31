@@ -1,0 +1,61 @@
+---
+title: "Period constants"
+description: "Pre-defined period values for common time series frequencies"
+---
+
+The `tsgam_estimator` package exports a set of named constants for the most common seasonality periods. Use them in place of raw numbers to make your model configuration self-documenting and less error-prone.
+
+<Note>
+  All period values are measured in **hours**, because TSGAM uses hours as its
+  internal time unit. Pass these constants to the `periods` argument of
+  `TsgamMultiPeriodicConfig` — do not convert them before use.
+</Note>
+
+## Constants
+
+| Constant | Value | Description |
+| -------- | ----- | ----------- |
+| `PERIOD_HOURLY_DAILY` | `24` | Hours in a day. Use with hourly data to capture daily seasonality. |
+| `PERIOD_HOURLY_WEEKLY` | `168` (`24 × 7`) | Hours in a week. Use with hourly data to capture weekly seasonality. |
+| `PERIOD_HOURLY_YEARLY` | `8766.18` (`24 × 365.2425`) | Hours in a mean calendar year. Use with hourly data to capture yearly seasonality. |
+| `PERIOD_DAILY_YEARLY` | `365.2425` | Days in a mean calendar year. Use with daily data to capture yearly seasonality. |
+| `PERIOD_WEEKLY_YEARLY` | `52.1775` | Weeks in a mean calendar year. Use with weekly data to capture yearly seasonality. |
+| `PERIOD_MONTHLY_YEARLY` | `12` | Months in a year. Use with monthly data. |
+| `PERIOD_QUARTERLY_YEARLY` | `4` | Quarters in a year. Use with quarterly data. |
+| `PERIOD_YEARLY_YEARLY` | `1` | One year expressed in years. Use with yearly data. |
+
+All constants are importable directly from `tsgam_estimator`.
+
+---
+
+## Examples
+
+**Standard hourly model with daily, weekly, and yearly seasonality**
+
+```python
+from tsgam_estimator import (
+    TsgamMultiPeriodicConfig,
+    PERIOD_HOURLY_DAILY,
+    PERIOD_HOURLY_WEEKLY,
+    PERIOD_HOURLY_YEARLY,
+)
+
+multi_periodic = TsgamMultiPeriodicConfig(
+    num_harmonics=[6, 4, 3],
+    periods=[PERIOD_HOURLY_DAILY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_YEARLY],
+)
+```
+
+**Daily data with yearly seasonality**
+
+```python
+from tsgam_estimator import (
+    TsgamMultiPeriodicConfig,
+    PERIOD_DAILY_YEARLY,
+)
+
+multi_periodic = TsgamMultiPeriodicConfig(
+    num_harmonics=[3],
+    periods=[PERIOD_DAILY_YEARLY],
+)
+```

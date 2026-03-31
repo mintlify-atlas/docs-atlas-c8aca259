@@ -1,97 +1,74 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: TSGAM Estimator
+description: A scikit-learn compatible Python library for time series load forecasting using Generalized Additive Models
 ---
 
-## Setting up
+**TSGAM Estimator** is an interpretable, scikit-learn-compatible Python library for time series forecasting. It decomposes your time series into seasonal patterns, exogenous variable effects, trends, and residual structure — all fitted via regularized convex optimization.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install and fit your first forecast model in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Model components" icon="cubes" href="/guides/model-components">
+    Understand Fourier seasonality, splines, trend, and AR residuals
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Examples" icon="flask" href="/examples/energy-forecasting">
+    Real-world examples for energy, air quality, and solar PV
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/tsgam-estimator">
+    Complete documentation for every public class and function
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key features
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Multi-periodic seasonality" icon="calendar">
+    Capture daily, weekly, and yearly patterns simultaneously using Fourier basis functions
+  </Card>
+  <Card title="Exogenous variables" icon="temperature-half">
+    Model non-linear weather effects (temperature, humidity) using cubic splines with lead/lag
+  </Card>
+  <Card title="Outlier detection" icon="triangle-exclamation">
+    Automatically identify anomalous periods (holidays, events) using sparse L1 corrections
+  </Card>
+  <Card title="AR residual modeling" icon="wave-square">
+    Capture remaining temporal dependencies with a sparse autoregressive model
+  </Card>
+  <Card title="Trend support" icon="chart-line">
+    Fit linear or nonlinear monotonic trends that evolve slowly over time
+  </Card>
+  <Card title="scikit-learn compatible" icon="puzzle-piece">
+    Use with pipelines, cross-validation, and grid search out of the box
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## How it works
 
-## Need inspiration?
+A TSGAM model additively combines independent components:
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
+```python
+from tsgam_estimator import (
+    TsgamEstimator, TsgamEstimatorConfig,
+    TsgamMultiPeriodicConfig, TsgamSplineConfig,
+    PERIOD_HOURLY_DAILY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_YEARLY,
+)
+
+# Configure seasonal and exogenous components
+config = TsgamEstimatorConfig(
+    multi_periodic_config=TsgamMultiPeriodicConfig(
+        num_harmonics=[6, 4, 3],
+        periods=[PERIOD_HOURLY_DAILY, PERIOD_HOURLY_WEEKLY, PERIOD_HOURLY_YEARLY],
+    ),
+    exog_config=[TsgamSplineConfig(n_knots=10, lags=[-1, 0, 1])],
+)
+
+# Fit and predict — standard scikit-learn API
+estimator = TsgamEstimator(config=config)
+estimator.fit(X_train, y_train)
+y_pred = estimator.predict(X_test)
+```
+
+<Card title="Get started now" icon="arrow-right" href="/quickstart">
+  Follow the quickstart guide to fit your first model
 </Card>
